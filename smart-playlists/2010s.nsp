@@ -1,0 +1,16 @@
+{
+  "name": "2010s",
+  "comment": "Tracks released from 2010 through 2019.",
+  "all": [
+    {
+      "inTheRange": {
+        "year": [
+          2010,
+          2019
+        ]
+      }
+    }
+  ],
+  "sort": "year,album,title",
+  "order": "asc"
+}

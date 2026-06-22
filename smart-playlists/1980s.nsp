@@ -1,0 +1,16 @@
+{
+  "name": "1980s",
+  "comment": "Tracks released from 1980 through 1989.",
+  "all": [
+    {
+      "inTheRange": {
+        "year": [
+          1980,
+          1989
+        ]
+      }
+    }
+  ],
+  "sort": "year,album,title",
+  "order": "asc"
+}

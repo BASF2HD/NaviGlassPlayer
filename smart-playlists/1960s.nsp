@@ -1,0 +1,16 @@
+{
+  "name": "1960s",
+  "comment": "Tracks released from 1960 through 1969.",
+  "all": [
+    {
+      "inTheRange": {
+        "year": [
+          1960,
+          1969
+        ]
+      }
+    }
+  ],
+  "sort": "year,album,title",
+  "order": "asc"
+}

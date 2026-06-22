@@ -1,0 +1,38 @@
+{
+  "name": "English Songs",
+  "comment": "Tracks tagged as English, or with English in common metadata fields.",
+  "any": [
+    {
+      "contains": {
+        "genre": "English"
+      }
+    },
+    {
+      "contains": {
+        "title": "English"
+      }
+    },
+    {
+      "contains": {
+        "album": "English"
+      }
+    },
+    {
+      "contains": {
+        "artist": "English"
+      }
+    },
+    {
+      "contains": {
+        "albumArtist": "English"
+      }
+    },
+    {
+      "contains": {
+        "filepath": "English"
+      }
+    }
+  ],
+  "sort": "album,title",
+  "order": "asc"
+}

@@ -1,0 +1,16 @@
+{
+  "name": "1970s",
+  "comment": "Tracks released from 1970 through 1979.",
+  "all": [
+    {
+      "inTheRange": {
+        "year": [
+          1970,
+          1979
+        ]
+      }
+    }
+  ],
+  "sort": "year,album,title",
+  "order": "asc"
+}
