@@ -1,0 +1,13 @@
+{
+  "name": "Devotional",
+  "comment": "Tracks stored under Devotional folders.",
+  "all": [
+    {
+      "contains": {
+        "filepath": "Devotional"
+      }
+    }
+  ],
+  "sort": "album,title",
+  "order": "asc"
+}

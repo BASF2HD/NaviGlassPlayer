@@ -1,0 +1,16 @@
+{
+  "name": "2000s",
+  "comment": "Tracks released from 2000 through 2009.",
+  "all": [
+    {
+      "inTheRange": {
+        "year": [
+          2000,
+          2009
+        ]
+      }
+    }
+  ],
+  "sort": "year,album,title",
+  "order": "asc"
+}

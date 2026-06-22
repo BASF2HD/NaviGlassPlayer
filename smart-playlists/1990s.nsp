@@ -1,0 +1,16 @@
+{
+  "name": "1990s",
+  "comment": "Tracks released from 1990 through 1999.",
+  "all": [
+    {
+      "inTheRange": {
+        "year": [
+          1990,
+          1999
+        ]
+      }
+    }
+  ],
+  "sort": "year,album,title",
+  "order": "asc"
+}

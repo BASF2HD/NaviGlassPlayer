@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NaviGlassPlayer</title>
+  <meta name="description" content="Glass-style web client for Navidrome.">
+  <meta name="theme-color" content="#08080f">
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="apple-touch-icon" href="./naviglassplayer-logo.svg">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <p class="eyebrow">Navidrome front end</p>
+      <h1>NaviGlassPlayer</h1>
+      <p class="lede">
+        A browser-based glass-style player for
+        <a href="https://www.navidrome.org/" rel="noopener noreferrer">Navidrome</a>.
+        Browse albums, artists, playlists, and genres with a WebGL carousel and built-in playback.
+      </p>
+      <div class="hero-actions">
+        <a class="btn primary" href="https://github.com/BASF2HD/NaviGlassPlayer" rel="noopener noreferrer">View on GitHub</a>
+        <a class="btn" href="https://github.com/BASF2HD/NaviGlassPlayer#app" rel="noopener noreferrer">Run locally</a>
+      </div>
+    </div>
+    <div class="hero-visual" aria-hidden="true">
+      <div class="cover-stack">
+        <div class="cover cover-a"></div>
+        <div class="cover cover-b"></div>
+        <div class="cover cover-c"></div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Quick start</h2>
+      <p>Clone the repo, start Navidrome, then run the local Node server:</p>
+      <pre><code>git clone https://github.com/BASF2HD/NaviGlassPlayer.git
+cd NaviGlassPlayer
+npm start</code></pre>
+      <p>Open <code>http://127.0.0.1:8787</code> and sign in with your Navidrome username and password.</p>
+    </section>
+
+    <section class="panel grid">
+      <article>
+        <h3>Subsonic API</h3>
+        <p>Uses Navidrome&apos;s Subsonic-compatible REST API for library browsing, cover art, and streaming.</p>
+      </article>
+      <article>
+        <h3>Local proxy</h3>
+        <p><code>server.mjs</code> serves the UI and proxies <code>/navidrome/*</code> to your Navidrome instance so the browser stays same-origin.</p>
+      </article>
+      <article>
+        <h3>Deploy scripts</h3>
+        <p>One-shot installers for Rocky Linux, Ubuntu, Synology DSM, and Raspberry Pi OS are included in the repo.</p>
+      </article>
+      <article>
+        <h3>Smart playlists</h3>
+        <p>Bundled <code>.nsp</code> templates for decade, language, and mood playlists live in <code>smart-playlists/</code>.</p>
+      </article>
+    </section>
+
+    <section class="panel note">
+      <h2>About this site</h2>
+      <p>
+        GitHub Pages hosts this project page only. The full player needs
+        <code>npm start</code> (or your own reverse proxy) because Navidrome credentials are sent through the local proxy, not from static hosting.
+      </p>
+      <p>
+        Deployment details:
+        <a href="https://github.com/BASF2HD/NaviGlassPlayer/blob/main/docs/deployment.md">docs/deployment.md</a>
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      <a href="https://github.com/BASF2HD/NaviGlassPlayer">NaviGlassPlayer</a>
+      &middot; MIT-style open source &middot; Not affiliated with Navidrome
+    </p>
+  </footer>
+</body>
+</html>

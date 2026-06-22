@@ -1,0 +1,38 @@
+{
+  "name": "Hindi Songs",
+  "comment": "Tracks tagged as Hindi, or with Hindi in common metadata fields.",
+  "any": [
+    {
+      "contains": {
+        "genre": "Hindi"
+      }
+    },
+    {
+      "contains": {
+        "title": "Hindi"
+      }
+    },
+    {
+      "contains": {
+        "album": "Hindi"
+      }
+    },
+    {
+      "contains": {
+        "artist": "Hindi"
+      }
+    },
+    {
+      "contains": {
+        "albumArtist": "Hindi"
+      }
+    },
+    {
+      "contains": {
+        "filepath": "Hindi"
+      }
+    }
+  ],
+  "sort": "album,title",
+  "order": "asc"
+}

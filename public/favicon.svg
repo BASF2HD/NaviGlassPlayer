@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="title desc">
+  <title id="title">NaviGlassPlayer favicon</title>
+  <desc id="desc">A gradient play button with a diagonal glass reflection.</desc>
+  <defs>
+    <linearGradient id="favGrad" x1="5" y1="4" x2="27" y2="28" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ec5e2a"/>
+      <stop offset="100%" stop-color="#103c7a"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="#ffffff"/>
+  <path d="M8 5.7C8 4.1 9.8 3.1 11.2 4L26 13.3C27.3 14.1 27.3 16 26 16.8L11.2 26.1C9.8 27 8 26 8 24.4Z" fill="url(#favGrad)"/>
+  <path d="M11 6.6L25.2 15.1H11Z" fill="#ffffff" opacity="0.2"/>
+  <path d="M10.7 24.6L24 9.4" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" opacity="0.82"/>
+</svg>

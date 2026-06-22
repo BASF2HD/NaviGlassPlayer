@@ -1,0 +1,16 @@
+{
+  "name": "2020s",
+  "comment": "Tracks released from 2020 through 2029.",
+  "all": [
+    {
+      "inTheRange": {
+        "year": [
+          2020,
+          2029
+        ]
+      }
+    }
+  ],
+  "sort": "year,album,title",
+  "order": "asc"
+}
