@@ -12,7 +12,7 @@ const publicDir = join(rootDir, "public");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 8787);
 const defaultNavidromeOrigin =
-  process.env.NAVIDROME_ORIGIN || "http://127.0.0.1:4533";
+  process.env.NAVIDROME_ORIGIN || "http://100.121.7.84:4533";
 const allowClientOriginOverride = /^(1|true|yes)$/i.test(
   process.env.ALLOW_CLIENT_ORIGIN_OVERRIDE || ""
 );

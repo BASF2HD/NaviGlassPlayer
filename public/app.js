@@ -18,7 +18,9 @@ import {
 } from "./renderer.js";
 
 const STORAGE_KEY = "naviglassplayer-settings";
-const SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
+const LEGACY_SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
+const DEFAULT_SERVER_URL = "http://100.121.7.84:4533";
+const LEGACY_DEFAULT_SERVER_URL = "http://127.0.0.1:4533";
 const CLIENT_NAME = "naviglassplayer";
 const API_VERSION = "1.16.1";
 const UNLIMITED_BROWSE_LIMIT = 0;
@@ -74,7 +76,7 @@ const DEFAULT_BROWSE_SORT = "year-asc";
 const SORT_DEFAULTS_VERSION = 1;
 
 const defaultSettings = {
-    serverUrl: "http://127.0.0.1:4533",
+    serverUrl: DEFAULT_SERVER_URL,
     username: "",
     password: "",
     shelf: "alphabeticalByName",
@@ -368,21 +370,24 @@ function normalizeBrowseSort(value) {
 function loadSettings() {
     try {
         const storedRaw = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || "{}");
-        const { selectedFolderPath: _selectedFolderPath, password: storedPassword, ...stored } = storedRaw;
-        if (storedPassword) {
+        const { selectedFolderPath: _selectedFolderPath, ...stored } = storedRaw;
+        if (!stored.serverUrl || normalizeServerUrl(stored.serverUrl) === LEGACY_DEFAULT_SERVER_URL) {
+            stored.serverUrl = DEFAULT_SERVER_URL;
+        }
+        if (_selectedFolderPath) {
             const sanitized = { ...storedRaw };
-            delete sanitized.password;
+            sanitized.serverUrl = stored.serverUrl;
             delete sanitized.selectedFolderPath;
             window.localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized));
         }
         const shouldUseNewSortDefaults = stored.sortDefaultsVersion !== SORT_DEFAULTS_VERSION;
-        const sessionPassword = window.sessionStorage.getItem(SESSION_PASSWORD_KEY) || "";
+        const legacySessionPassword = window.sessionStorage.getItem(LEGACY_SESSION_PASSWORD_KEY) || "";
         const savedSortOrDefault = (value) =>
             normalizeBrowseSort(shouldUseNewSortDefaults ? DEFAULT_BROWSE_SORT : value || DEFAULT_BROWSE_SORT);
         return {
             ...defaultSettings,
             ...stored,
-            password: sessionPassword,
+            password: String(stored.password || legacySessionPassword || ""),
             serverUrl: normalizeServerUrl(stored.serverUrl || defaultSettings.serverUrl),
             shelf: normalizeAlbumShelf(stored.shelf || defaultSettings.shelf),
             // Force unlimited browsing by default; older saved limits are intentionally ignored.
@@ -439,12 +444,8 @@ function saveSettings() {
     state.settings.artistBrowseSort = normalizeBrowseSort(state.settings.artistBrowseSort);
     state.settings.artistDisplayMode = normalizeTrackDisplayMode(state.settings.artistDisplayMode);
     state.settings.sortDefaultsVersion = SORT_DEFAULTS_VERSION;
-    const { password: _password, ...persistedSettings } = state.settings;
-    if (state.settings.password) {
-        window.sessionStorage.setItem(SESSION_PASSWORD_KEY, state.settings.password);
-    } else {
-        window.sessionStorage.removeItem(SESSION_PASSWORD_KEY);
-    }
+    const persistedSettings = { ...state.settings };
+    window.sessionStorage.removeItem(LEGACY_SESSION_PASSWORD_KEY);
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSettings));
 }
 
