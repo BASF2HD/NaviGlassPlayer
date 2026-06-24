@@ -62,6 +62,7 @@ const BROWSE_MODE = Object.freeze({
     ALBUM: "album",
     SONGS: "songs",
     ARTIST: "artist",
+    ALBUM_ARTIST: "albumArtist",
     COMPOSER: "composer",
     PLAYLIST: "playlist",
     SEARCH: "search",
@@ -85,6 +86,7 @@ const defaultSettings = {
     viewMode: BROWSE_MODE.ALBUM,
     selectedArtistId: "",
     selectedArtistName: "",
+    selectedAlbumArtist: "",
     selectedComposer: "",
     artistPanel: "artist",
     artistBrowseSort: DEFAULT_BROWSE_SORT,
@@ -266,6 +268,8 @@ const state = {
     infoTrackIndex: null,
     connected: false,
     artistOptions: [],
+    albumArtistOptions: [],
+    albumArtistAlbumCache: [],
     composerOptions: [],
     composerSongCache: [],
     playlistOptions: [],
@@ -359,6 +363,28 @@ function normalizeMoreMode(value) {
         : "";
 }
 
+function normalizeArtistPanel(value) {
+    return ["artist", "albumArtist", "composer"].includes(value) ? value : "artist";
+}
+
+function isArtistBrowseMode(mode = state.browseMode) {
+    return [
+        BROWSE_MODE.ARTIST,
+        BROWSE_MODE.ALBUM_ARTIST,
+        BROWSE_MODE.COMPOSER,
+    ].includes(mode);
+}
+
+function browseModeForArtistPanel(panel = state.settings.artistPanel) {
+    if (panel === "albumArtist") {
+        return BROWSE_MODE.ALBUM_ARTIST;
+    }
+    if (panel === "composer") {
+        return BROWSE_MODE.COMPOSER;
+    }
+    return BROWSE_MODE.ARTIST;
+}
+
 function normalizeTrackDisplayMode(value) {
     return VALID_TRACK_DISPLAY_MODES.has(value) ? value : TRACK_DISPLAY_MODE.ALBUM;
 }
@@ -397,8 +423,9 @@ function loadSettings() {
             moreMode: normalizeMoreMode(stored.moreMode || ""),
             selectedArtistId: String(stored.selectedArtistId || ""),
             selectedArtistName: String(stored.selectedArtistName || ""),
+            selectedAlbumArtist: String(stored.selectedAlbumArtist || ""),
             selectedComposer: String(stored.selectedComposer || ""),
-            artistPanel: stored.artistPanel === "composer" ? "composer" : "artist",
+            artistPanel: normalizeArtistPanel(stored.artistPanel),
             artistBrowseSort: savedSortOrDefault(stored.artistBrowseSort),
             artistDisplayMode: normalizeTrackDisplayMode(stored.artistDisplayMode || defaultSettings.artistDisplayMode),
             selectedPlaylistId: String(stored.selectedPlaylistId || ""),
@@ -437,9 +464,10 @@ function saveSettings() {
     state.settings.songsDisplayMode = normalizeTrackDisplayMode(state.settings.songsDisplayMode);
     state.settings.playlistBrowseSort = normalizeBrowseSort(state.settings.playlistBrowseSort);
     state.settings.playlistDisplayMode = normalizeTrackDisplayMode(state.settings.playlistDisplayMode);
-    state.settings.artistPanel = state.settings.artistPanel === "composer" ? "composer" : "artist";
+    state.settings.artistPanel = normalizeArtistPanel(state.settings.artistPanel);
     state.settings.selectedArtistId = String(state.settings.selectedArtistId || "");
     state.settings.selectedArtistName = String(state.settings.selectedArtistName || "");
+    state.settings.selectedAlbumArtist = String(state.settings.selectedAlbumArtist || "");
     state.settings.selectedComposer = String(state.settings.selectedComposer || "");
     state.settings.artistBrowseSort = normalizeBrowseSort(state.settings.artistBrowseSort);
     state.settings.artistDisplayMode = normalizeTrackDisplayMode(state.settings.artistDisplayMode);
@@ -1546,6 +1574,72 @@ async function ensureArtistOptions(force = false) {
     return state.artistOptions;
 }
 
+function normalizeAlbumArtistOptions(albums) {
+    const albumArtists = new Map();
+    for (const album of albums) {
+        const value = pickText(album?.artist, "Unknown Album Artist");
+        const key = value.toLocaleLowerCase();
+        const existing = albumArtists.get(key) || {
+            value,
+            title: value,
+            albumCount: 0,
+            songCount: 0,
+        };
+        existing.albumCount += 1;
+        existing.songCount += Number(album?.songCount || 0);
+        albumArtists.set(key, existing);
+    }
+
+    return [...albumArtists.values()]
+        .map((albumArtist) => ({
+            ...albumArtist,
+            subtitle: `${albumArtist.albumCount} ${albumArtist.albumCount === 1 ? "album" : "albums"}`,
+        }))
+        .sort((left, right) =>
+            left.title.localeCompare(right.title, undefined, { numeric: true, sensitivity: "base" })
+        );
+}
+
+async function fetchAlbumArtistAlbumCache() {
+    const albums = [];
+    const seen = new Set();
+
+    for (let offset = 0; ; offset += ALBUM_PAGE_SIZE) {
+        const batch = await fetchAlbumShelfPage("alphabeticalByArtist", offset, ALBUM_PAGE_SIZE);
+        for (const album of batch) {
+            if (!album.id || seen.has(album.id)) {
+                continue;
+            }
+            seen.add(album.id);
+            albums.push(album);
+        }
+        if (batch.length < ALBUM_PAGE_SIZE) {
+            break;
+        }
+    }
+
+    return albums;
+}
+
+async function ensureAlbumArtistOptions(force = false) {
+    if (!force && state.albumArtistOptions.length) {
+        return state.albumArtistOptions;
+    }
+    if (force || !state.albumArtistAlbumCache.length) {
+        state.albumArtistAlbumCache = await fetchAlbumArtistAlbumCache();
+    }
+    state.albumArtistOptions = normalizeAlbumArtistOptions(state.albumArtistAlbumCache);
+
+    if (!state.albumArtistOptions.some((artist) => artist.value === state.settings.selectedAlbumArtist)) {
+        const firstUsefulArtist =
+            state.albumArtistOptions.find((artist) => artist.title && artist.title !== "Unknown Album Artist") ||
+            state.albumArtistOptions[0];
+        state.settings.selectedAlbumArtist = firstUsefulArtist?.value || "";
+        saveSettings();
+    }
+    return state.albumArtistOptions;
+}
+
 function normalizeComposerOptions(tracks) {
     const composers = new Map();
     for (const track of tracks) {
@@ -1920,6 +2014,63 @@ async function fetchArtistSongs() {
         : songs;
 }
 
+async function fetchAlbumArtistSongs() {
+    const albumArtists = await ensureAlbumArtistOptions();
+    const selectedAlbumArtist =
+        albumArtists.find((artist) => artist.value === state.settings.selectedAlbumArtist) ||
+        albumArtists.find((artist) => artist.title && artist.title !== "Unknown Album Artist") ||
+        albumArtists[0];
+    if (!selectedAlbumArtist) {
+        return [];
+    }
+    state.settings.selectedAlbumArtist = selectedAlbumArtist.value;
+    saveSettings();
+
+    if (!state.albumArtistAlbumCache.length) {
+        state.albumArtistAlbumCache = await fetchAlbumArtistAlbumCache();
+    }
+    const selectedKey = selectedAlbumArtist.value.toLocaleLowerCase();
+    const albums = state.albumArtistAlbumCache.filter(
+        (album) => pickText(album?.artist, "Unknown Album Artist").toLocaleLowerCase() === selectedKey
+    );
+
+    if (state.settings.artistDisplayMode === TRACK_DISPLAY_MODE.ALBUM) {
+        return albums.map((album) => ({
+            ...album,
+            source: BROWSE_MODE.ALBUM_ARTIST,
+            contextId: selectedAlbumArtist.value,
+        }));
+    }
+
+    const albumPayloads = await Promise.all(
+        albums.map((album) =>
+            fetchJson("/rest/getAlbum.view", { id: album.id }).catch(() => null)
+        )
+    );
+    const songs = [];
+    for (const ap of albumPayloads) {
+        const album = ap?.album;
+        if (!album) continue;
+        const albumArtist = pickText(album.artist, selectedAlbumArtist.value);
+        for (const track of ensureArray(album.song)) {
+            songs.push(normalizeTrack(track, {
+                source: BROWSE_MODE.ALBUM_ARTIST,
+                contextId: selectedAlbumArtist.value,
+                key: `song:albumArtist:${selectedKey}:${track.id || songs.length}`,
+                albumId: album.id,
+                albumTitle: album.title || album.name,
+                artist: pickText(track.artist, albumArtist),
+                albumArtist,
+                year: album.year,
+                coverArt: album.coverArt,
+                index: songs.length,
+            }));
+        }
+    }
+
+    return songs;
+}
+
 async function fetchComposerSongs() {
     const composers = await ensureComposerOptions();
     const selectedComposer =
@@ -2185,6 +2336,8 @@ async function fetchBrowseEntriesForMode(mode) {
             return fetchSongs();
         case BROWSE_MODE.ARTIST:
             return fetchArtistSongs();
+        case BROWSE_MODE.ALBUM_ARTIST:
+            return fetchAlbumArtistSongs();
         case BROWSE_MODE.COMPOSER:
             return fetchComposerSongs();
         case BROWSE_MODE.PLAYLIST:
@@ -2247,6 +2400,14 @@ function getBrowseEntryCacheKey(mode = state.browseMode) {
                 mode,
                 settings.selectedArtistId,
                 settings.selectedArtistName,
+                normalizeTrackDisplayMode(settings.artistDisplayMode),
+                normalizeBrowseSort(settings.artistBrowseSort),
+                limit,
+            ].map(browseCachePart).join("|");
+        case BROWSE_MODE.ALBUM_ARTIST:
+            return [
+                mode,
+                settings.selectedAlbumArtist,
                 normalizeTrackDisplayMode(settings.artistDisplayMode),
                 normalizeBrowseSort(settings.artistBrowseSort),
                 limit,
@@ -2344,6 +2505,8 @@ function invalidateLibraryCaches({ persistent = true } = {}) {
     playlistMembershipCache.clear();
     state.detailsCache.clear();
     state.artistOptions = [];
+    state.albumArtistOptions = [];
+    state.albumArtistAlbumCache = [];
     state.composerOptions = [];
     state.composerSongCache = [];
     state.playlistOptions = [];
@@ -2588,8 +2751,8 @@ async function connect({ onAuthenticated } = {}) {
     activeLibraryCacheScope = nextCacheScope;
     onAuthenticated?.();
     // The all-songs shelf is intentionally a full-library view, so restoring
-    // it immediately on connect makes startup feel much slower. Artist and
-    // Composer are scoped selections and should persist normally.
+    // it immediately on connect makes startup feel much slower. Artist,
+    // Album Artist, and Composer are scoped selections and should persist normally.
     if (state.browseMode === BROWSE_MODE.SONGS) {
         state.browseMode = BROWSE_MODE.ALBUM;
     }
@@ -2603,6 +2766,7 @@ async function connect({ onAuthenticated } = {}) {
 async function warmMenus() {
     await Promise.allSettled([
         ensureArtistOptions(),
+        ensureAlbumArtistOptions(),
         ensureComposerOptions(),
         ensurePlaylistOptions(),
         ensureGenreOptions(),
@@ -3396,7 +3560,7 @@ function renderSongsDropdown() {
 }
 
 function renderArtistDropdown() {
-    const activePanel = state.settings.artistPanel === "composer" ? "composer" : "artist";
+    const activePanel = normalizeArtistPanel(state.settings.artistPanel);
     const artistItems = state.artistOptions.length
         ? state.artistOptions.map((artist) => `
             <button class="browse-dropdown-item ${state.browseMode === BROWSE_MODE.ARTIST && (artist.id === state.settings.selectedArtistId || artist.title === state.settings.selectedArtistName) ? "is-selected" : ""}" data-artist-id="${escapeHtml(artist.id)}" data-artist-name="${escapeHtml(artist.title)}">
@@ -3407,6 +3571,18 @@ function renderArtistDropdown() {
         : `
             <button class="browse-dropdown-item" disabled>
                 <span class="browse-dropdown-label">No artists</span>
+            </button>
+        `;
+    const albumArtistItems = state.albumArtistOptions.length
+        ? state.albumArtistOptions.map((artist) => `
+            <button class="browse-dropdown-item ${state.browseMode === BROWSE_MODE.ALBUM_ARTIST && artist.value === state.settings.selectedAlbumArtist ? "is-selected" : ""}" data-album-artist-name="${escapeHtml(artist.value)}">
+                <span class="browse-dropdown-label">${escapeHtml(artist.title)}</span>
+                <span class="browse-dropdown-meta">${escapeHtml(artist.subtitle || "\u00A0")}</span>
+            </button>
+        `).join("")
+        : `
+            <button class="browse-dropdown-item" disabled>
+                <span class="browse-dropdown-label">No album artists</span>
             </button>
         `;
     const composerItems = state.composerOptions.length
@@ -3431,6 +3607,13 @@ function renderArtistDropdown() {
                 </span>
                 <span class="browse-dropdown-meta">${state.artistOptions.length ? `${state.artistOptions.length} artists` : "Browse artists"}</span>
             </button>
+            <button class="browse-dropdown-item ${activePanel === "albumArtist" ? "is-selected" : ""}" data-artist-panel="albumArtist">
+                <span class="browse-dropdown-label-row">
+                    <span class="browse-dropdown-label">Album Artists</span>
+                    ${renderDropdownCheck(activePanel === "albumArtist")}
+                </span>
+                <span class="browse-dropdown-meta">${state.albumArtistOptions.length ? `${state.albumArtistOptions.length} album artists` : "Browse album artists"}</span>
+            </button>
             <button class="browse-dropdown-item ${activePanel === "composer" ? "is-selected" : ""}" data-artist-panel="composer">
                 <span class="browse-dropdown-label-row">
                     <span class="browse-dropdown-label">Composers</span>
@@ -3446,7 +3629,7 @@ function renderArtistDropdown() {
             ${renderSortOptions(state.settings.artistBrowseSort, "artist-sort")}
         </div>
         <div class="browse-dropdown-section browse-dropdown-sublist">
-            ${activePanel === "composer" ? composerItems : artistItems}
+            ${activePanel === "composer" ? composerItems : activePanel === "albumArtist" ? albumArtistItems : artistItems}
         </div>
     `;
     finalizeBrowseDropdown(elements.artistDropdown, "Artists");
@@ -3777,7 +3960,7 @@ function getActiveBrowseMenu() {
     if (state.browseMode === BROWSE_MODE.PLAYLIST) {
         return BROWSE_MODE.PLAYLIST;
     }
-    if (state.browseMode === BROWSE_MODE.COMPOSER) {
+    if (state.browseMode === BROWSE_MODE.ALBUM_ARTIST || state.browseMode === BROWSE_MODE.COMPOSER) {
         return BROWSE_MODE.ARTIST;
     }
     if ([
@@ -3884,7 +4067,7 @@ function sortBrowseEntriesForCurrentMode(entries) {
             ? normalizeBrowseSort(state.settings.songsBrowseSort)
             : state.browseMode === BROWSE_MODE.ALBUM
                 ? normalizeBrowseSort(state.settings.albumBrowseSort)
-                : [BROWSE_MODE.ARTIST, BROWSE_MODE.COMPOSER].includes(state.browseMode)
+                : isArtistBrowseMode(state.browseMode)
                     ? normalizeBrowseSort(state.settings.artistBrowseSort)
                     : state.browseMode === BROWSE_MODE.PLAYLIST
                         ? normalizeBrowseSort(state.settings.playlistBrowseSort)
@@ -5805,6 +5988,16 @@ function keyForTrackInCurrentMode(track) {
             }
             return browseEntries.find((entry) => entry.id === track.id)?.key || null;
         }
+        case BROWSE_MODE.ALBUM_ARTIST:
+            if (!state.settings.selectedAlbumArtist ||
+                String(track.albumArtist || track.artist || "").toLocaleLowerCase() !== state.settings.selectedAlbumArtist.toLocaleLowerCase()) {
+                return null;
+            }
+            return browseEntries.find((entry) =>
+                entry.id === track.id ||
+                entry.id === track.albumId ||
+                entry.groupTracks?.some((groupTrack) => groupTrack.id === track.id)
+            )?.key || null;
         case BROWSE_MODE.COMPOSER:
             if (!state.settings.selectedComposer || !String(track.composer || "")
                 .split(/[;,]/)
@@ -7180,12 +7373,15 @@ function setupInput() {
             if (!state.artistOptions.length) {
                 await ensureArtistOptions();
             }
+            if (state.settings.artistPanel === "albumArtist" && !state.albumArtistOptions.length) {
+                await ensureAlbumArtistOptions();
+            }
             if (state.settings.artistPanel === "composer" && !state.composerOptions.length) {
                 await ensureComposerOptions();
             }
         }
-        if (![BROWSE_MODE.ARTIST, BROWSE_MODE.COMPOSER].includes(state.browseMode)) {
-            await setBrowseMode(BROWSE_MODE.ARTIST, { activeDropdown: nextDropdown });
+        if (!isArtistBrowseMode(state.browseMode)) {
+            await setBrowseMode(browseModeForArtistPanel(), { activeDropdown: nextDropdown });
             return;
         }
         renderBrowseMenus();
@@ -7226,8 +7422,11 @@ function setupInput() {
         event.stopPropagation();
         const panelOption = event.target.closest("button[data-artist-panel]");
         if (panelOption) {
-            state.settings.artistPanel = panelOption.dataset.artistPanel === "composer" ? "composer" : "artist";
+            state.settings.artistPanel = normalizeArtistPanel(panelOption.dataset.artistPanel);
             saveSettings();
+            if (state.settings.artistPanel === "albumArtist" && state.connected && !state.albumArtistOptions.length) {
+                await ensureAlbumArtistOptions();
+            }
             if (state.settings.artistPanel === "composer" && state.connected && !state.composerOptions.length) {
                 await ensureComposerOptions();
             }
@@ -7238,7 +7437,7 @@ function setupInput() {
         if (displayOption) {
             state.settings.artistDisplayMode = normalizeTrackDisplayMode(displayOption.dataset.displayMode);
             saveSettings();
-            if ([BROWSE_MODE.ARTIST, BROWSE_MODE.COMPOSER].includes(state.browseMode)) {
+            if (isArtistBrowseMode()) {
                 await reloadBrowseEntries({ animate: false });
             }
             renderBrowseMenus();
@@ -7248,7 +7447,7 @@ function setupInput() {
         if (sortOption) {
             state.settings.artistBrowseSort = normalizeBrowseSort(sortOption.dataset.sortMode);
             saveSettings();
-            if ([BROWSE_MODE.ARTIST, BROWSE_MODE.COMPOSER].includes(state.browseMode)) {
+            if (isArtistBrowseMode()) {
                 await reloadBrowseEntries({ animate: false });
             }
             renderBrowseMenus();
@@ -7260,6 +7459,14 @@ function setupInput() {
             state.settings.artistPanel = "composer";
             saveSettings();
             await setBrowseMode(BROWSE_MODE.COMPOSER);
+            return;
+        }
+        const albumArtistOption = event.target.closest("button[data-album-artist-name]");
+        if (albumArtistOption) {
+            state.settings.selectedAlbumArtist = albumArtistOption.dataset.albumArtistName || "";
+            state.settings.artistPanel = "albumArtist";
+            saveSettings();
+            await setBrowseMode(BROWSE_MODE.ALBUM_ARTIST);
             return;
         }
         const option = event.target.closest("button[data-artist-id]");
