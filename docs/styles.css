@@ -101,42 +101,13 @@ h1 {
   min-height: 320px;
 }
 
-.cover-stack {
-  position: relative;
-  width: 280px;
-  height: 280px;
-}
-
-.cover {
-  position: absolute;
-  inset: auto;
-  width: 180px;
-  height: 180px;
+.hero-visual img {
+  width: min(100%, 520px);
+  aspect-ratio: 2 / 1;
+  object-fit: cover;
   border-radius: 18px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: var(--shadow);
-}
-
-.cover-a {
-  left: 0;
-  top: 48px;
-  transform: rotate(-18deg);
-  background: linear-gradient(145deg, #334155, #111827);
-}
-
-.cover-b {
-  left: 50px;
-  top: 18px;
-  transform: rotate(0deg);
-  background: linear-gradient(145deg, #475569, #1e293b);
-  z-index: 2;
-}
-
-.cover-c {
-  left: 100px;
-  top: 48px;
-  transform: rotate(18deg);
-  background: linear-gradient(145deg, #64748b, #0f172a);
 }
 
 main {
