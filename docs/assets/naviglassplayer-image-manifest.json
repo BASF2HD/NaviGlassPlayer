@@ -1,0 +1,29 @@
+{
+  "project": "NaviGlassPlayer",
+  "createdFor": [
+    "GitHub README banner",
+    "GitHub Pages hero image",
+    "GitHub Pages Open Graph image"
+  ],
+  "assets": [
+    {
+      "file": "naviglassplayer-github-banner.png",
+      "dimensions": "1280x640",
+      "usage": "README banner and GitHub Pages hero image"
+    },
+    {
+      "file": "naviglassplayer-og.png",
+      "dimensions": "1200x630",
+      "usage": "Open Graph and Twitter summary_large_image preview"
+    },
+    {
+      "file": "naviglassplayer-generated-background.png",
+      "usage": "Generated text-free source background for provenance"
+    }
+  ],
+  "provenance": {
+    "generatedLayer": "AI-generated text-free glass album carousel background",
+    "deterministicLayer": "Title, subtitle, metadata, frame, play mark, and final dimensions composited locally"
+  },
+  "promptSummary": "Dark glassmorphism WebGL-style music library carousel for a Navidrome browser player, with no text, logos, UI labels, real album art, or watermarks."
+}

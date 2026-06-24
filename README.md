@@ -1,5 +1,7 @@
 # NaviGlassPlayer
 
+![NaviGlassPlayer glass-style music player banner](docs/assets/naviglassplayer-github-banner.png)
+
 This repo contains a standalone NaviGlassPlayer web client plus fresh-install deployment scripts for Rocky Linux, Ubuntu, Synology DSM, and Raspberry Pi OS.
 
 ## App
