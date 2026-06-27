@@ -672,9 +672,9 @@ function _createReflectionFadeTexture() {
     const ctx = canvas.getContext("2d");
     const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
     gradient.addColorStop(0, "#080808");
-    gradient.addColorStop(0.38, "#292929");
-    gradient.addColorStop(0.72, "#a3a3a3");
-    gradient.addColorStop(1, "#fff");
+    gradient.addColorStop(0.32, "#6f6f6f");
+    gradient.addColorStop(0.58, "#ededed");
+    gradient.addColorStop(1, "#ffffff");
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
