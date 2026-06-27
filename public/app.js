@@ -32,12 +32,18 @@ const MAX_BROWSE_ENTRY_CACHE_ITEMS = 16;
 const MAX_HOT_TEXTURE_CACHE_ITEMS = 500;
 const TEXTURE_PRELOAD_EXTRA_COVERS = 10;
 const TEXTURE_PRELOAD_MAX_RADIUS = 32;
+const DRAWER_DETAIL_PREFETCH_RADIUS = 6;
+const DRAWER_DETAIL_PREFETCH_MAX_ALBUMS = 24;
 const CACHE_DB_NAME = "naviglassplayer-cache";
 const CACHE_DB_VERSION = 1;
 const BROWSE_CACHE_STORE = "browseViews";
 const ARTWORK_CACHE_STORE = "artwork";
+const BROWSE_CACHE_SCHEMA_VERSION = 3;
 const PERSISTENT_BROWSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PERSISTENT_ARTWORK_ITEMS = 3500;
+const STREAM_CACHE_SEEK_WAIT_MS = 45000;
+const STREAM_CACHE_POLL_MS = 900;
+const STREAM_CACHE_HANDOFF_POLL_MS = 1200;
 const DEFAULT_FONT_SCALE = 1;
 const MIN_FONT_SCALE = 0.5;
 const MAX_FONT_SCALE = 1.6;
@@ -73,8 +79,8 @@ const BROWSE_MODE = Object.freeze({
     RADIO: "radio",
 });
 
-const DEFAULT_BROWSE_SORT = "year-asc";
-const SORT_DEFAULTS_VERSION = 1;
+const DEFAULT_BROWSE_SORT = "year-desc";
+const SORT_DEFAULTS_VERSION = 2;
 
 const defaultSettings = {
     serverUrl: DEFAULT_SERVER_URL,
@@ -226,11 +232,22 @@ let searchBaseTextures = new Map();
 let searchBaseMode = BROWSE_MODE.ALBUM;
 let lastSearchClickIndex = -1;
 let lastSearchClickAt = 0;
+let streamRecoveryAttempts = 0;
+let streamRecoveryTrackKey = "";
+let seekRetryTimerId = 0;
+let seekPrepareId = 0;
+let streamCacheReadyKeys = new Set();
+let streamCacheHandoffDoneKeys = new Set();
+let streamCacheHandoffTimerId = 0;
+let streamCacheHandoffInProgress = false;
+let playbackIntentPlaying = false;
 let playlistMembershipCache = new Map();
 let radioCoverLookupPromises = new Map();
 let browseEntryCache = new Map();
 let activeBrowseEntryCacheKey = "";
 let coverTextureCache = new Map();
+let albumDetailsLoadPromises = new Map();
+let drawerDetailPrefetchTimerId = 0;
 let cacheDbPromise = null;
 let activeLibraryCacheScope = "";
 let persistentArtworkWriteCount = 0;
@@ -723,6 +740,10 @@ async function getPersistentBrowseEntryCache(cacheKey) {
     if (!record?.value || Date.now() - Number(record.updatedAt || 0) > PERSISTENT_BROWSE_CACHE_TTL_MS) {
         return null;
     }
+    if (!isBrowseCacheValueValid(cacheKey, record.value)) {
+        deletePersistentBrowseEntryCaches(browseModeFromCacheKey(cacheKey));
+        return null;
+    }
     return record.value;
 }
 
@@ -918,6 +939,19 @@ function buildProxyUrl(path, extraParams = {}, options = {}) {
     return `/navidrome${path}?${params.toString()}`;
 }
 
+function buildServerApiUrl(path, extraParams = {}, options = {}) {
+    const expectsJson = options.expectsJson ?? true;
+    const authMode = options.authMode || state.authMode;
+    const params = new URLSearchParams({
+        ...authParams({ expectsJson, authMode }),
+        ...Object.fromEntries(
+            Object.entries(extraParams).map(([key, value]) => [key, String(value)])
+        ),
+        __origin: state.settings.serverUrl,
+    });
+    return `${path}?${params.toString()}`;
+}
+
 async function fetchJson(path, params = {}) {
     const modes = state.authMode === "token" ? ["token", "encoded"] : [state.authMode];
     let lastError;
@@ -954,6 +988,223 @@ async function fetchJson(path, params = {}) {
     );
 }
 
+async function fetchServerCachedJson(path, params = {}) {
+    const modes = state.authMode === "token" ? ["token", "encoded"] : [state.authMode];
+    let lastError;
+
+    for (const authMode of modes) {
+        const response = await fetch(buildServerApiUrl(path, params, { authMode }), {
+            headers: { accept: "application/json" },
+        });
+
+        let payload;
+        try {
+            payload = await response.json();
+        } catch {
+            throw new Error("NaviGlassPlayer cache returned an invalid response.");
+        }
+
+        const envelope = payload["subsonic-response"];
+        const message =
+            envelope?.error?.message || payload?.error || payload?.details || `HTTP ${response.status}`;
+
+        if (response.ok && envelope?.status === "ok") {
+            state.authMode = authMode;
+            return envelope;
+        }
+
+        lastError = new Error(message || "Cached Navidrome request failed.");
+        if (!/wrong username or password/i.test(message || "")) {
+            throw lastError;
+        }
+    }
+
+    throw new Error(
+        `${lastError?.message || "Wrong username or password"}. Use your Navidrome app login, not the Linux SSH password.`
+    );
+}
+
+function warmServerAlbumDetails(albumIds) {
+    const ids = [...new Set(albumIds.map(String).filter(Boolean))];
+    if (!ids.length) {
+        return;
+    }
+    fetch(buildServerApiUrl("/api/cache/navidrome/warm-albums", { ids: ids.join(",") }), {
+        headers: { accept: "application/json" },
+    }).catch(() => {});
+}
+
+function shouldUsePhoneSeekCache() {
+    const userAgent = navigator.userAgent || "";
+    const mobileUserAgent = /Android|iPhone|iPod|Mobile/i.test(userAgent)
+        || (/iPad/i.test(userAgent) && navigator.maxTouchPoints > 1);
+    const coarsePointer = Boolean(window.matchMedia?.("(pointer: coarse)")?.matches);
+    return mobileUserAgent || (coarsePointer && window.innerWidth <= 900);
+}
+
+function isServerCachedTrack(track) {
+    return Boolean(
+        shouldUsePhoneSeekCache()
+        && track?.id
+        && !track.previewUrl
+        && !track.streamUrl
+        && track.kind !== "radio"
+    );
+}
+
+function serverStreamCacheKey(track) {
+    return isServerCachedTrack(track) ? `${track.id}|mp3|320` : "";
+}
+
+function serverStreamParams(track) {
+    return { id: track?.id, format: "mp3", maxBitRate: 320 };
+}
+
+function warmServerStreamCache(track) {
+    if (!isServerCachedTrack(track)) {
+        return;
+    }
+    fetch(buildServerApiUrl("/api/cache/navidrome/warm-stream", serverStreamParams(track)), {
+        headers: { accept: "application/json" },
+    })
+        .then((response) => response.ok ? response.json() : null)
+        .then((payload) => {
+            if (payload?.ready) {
+                streamCacheReadyKeys.add(serverStreamCacheKey(track));
+            }
+        })
+        .catch(() => {});
+}
+
+async function getServerStreamCacheStatus(track) {
+    if (!isServerCachedTrack(track)) {
+        return { ready: true, caching: false, size: 0 };
+    }
+    const response = await fetch(buildServerApiUrl("/api/cache/navidrome/stream-status", serverStreamParams(track)), {
+        headers: { accept: "application/json" },
+    });
+    if (!response.ok) {
+        throw new Error(`Audio cache status failed with HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    if (payload?.ready) {
+        streamCacheReadyKeys.add(serverStreamCacheKey(track));
+    }
+    return payload;
+}
+
+async function waitForServerStreamCacheReady(track, prepareId, timeoutMs = STREAM_CACHE_SEEK_WAIT_MS) {
+    if (!isServerCachedTrack(track)) {
+        return true;
+    }
+    const cacheKey = serverStreamCacheKey(track);
+    if (streamCacheReadyKeys.has(cacheKey)) {
+        return true;
+    }
+    warmServerStreamCache(track);
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        if (prepareId !== seekPrepareId || getTrackRecoveryKey(track) !== getTrackRecoveryKey(state.currentTrack)) {
+            return false;
+        }
+        try {
+            const status = await getServerStreamCacheStatus(track);
+            if (status?.ready) {
+                return true;
+            }
+        } catch {
+            // Keep polling; the warm stream may still be in progress.
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, STREAM_CACHE_POLL_MS));
+    }
+    return false;
+}
+
+function clearStreamCacheHandoffTimer() {
+    if (streamCacheHandoffTimerId) {
+        window.clearTimeout(streamCacheHandoffTimerId);
+        streamCacheHandoffTimerId = 0;
+    }
+}
+
+function cacheReadyPlaybackUrl(track) {
+    const url = new URL(playbackUrl(track), window.location.href);
+    url.searchParams.set("__ready", String(Date.now()));
+    return `${url.pathname}${url.search}`;
+}
+
+async function switchPhonePlaybackToCachedStream(track, trackKey) {
+    if (streamCacheHandoffInProgress || !isServerCachedTrack(track)) {
+        return;
+    }
+    if (streamCacheHandoffDoneKeys.has(trackKey)) {
+        return;
+    }
+    if (!state.currentTrack || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
+        return;
+    }
+
+    const shouldResume = playbackIntentPlaying || !elements.audioPlayer.paused;
+    const resumeAt = Math.max(0, Number(elements.audioPlayer.currentTime || playbackState.elapsed || 0));
+    streamCacheHandoffInProgress = true;
+    try {
+        elements.audioPlayer.preload = "auto";
+        elements.audioPlayer.src = cacheReadyPlaybackUrl(track);
+        elements.audioPlayer.load();
+        await waitForAudioReady(3200);
+        if (!state.currentTrack || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
+            return;
+        }
+        streamCacheHandoffDoneKeys.add(trackKey);
+        if (resumeAt > 0) {
+            setAudioCurrentTime(resumeAt);
+        }
+        if (shouldResume) {
+            playbackIntentPlaying = true;
+            await elements.audioPlayer.play().catch((error) => {
+                if (error?.name !== "AbortError") {
+                    playbackIntentPlaying = false;
+                    flashStatus("Browser playback was blocked.", 2200);
+                }
+            });
+        }
+    } finally {
+        streamCacheHandoffInProgress = false;
+    }
+}
+
+function schedulePhoneStreamCacheHandoff(track = state.currentTrack) {
+    clearStreamCacheHandoffTimer();
+    if (!isServerCachedTrack(track)) {
+        return;
+    }
+    const trackKey = getTrackRecoveryKey(track);
+    if (!trackKey || !playbackIntentPlaying) {
+        return;
+    }
+    if (streamCacheHandoffDoneKeys.has(trackKey)) {
+        return;
+    }
+    streamCacheHandoffTimerId = window.setTimeout(async () => {
+        streamCacheHandoffTimerId = 0;
+        if (!state.currentTrack || getTrackRecoveryKey(state.currentTrack) !== trackKey || !playbackIntentPlaying) {
+            return;
+        }
+        try {
+            const status = await getServerStreamCacheStatus(track);
+            if (status?.ready) {
+                await switchPhonePlaybackToCachedStream(track, trackKey);
+                return;
+            }
+        } catch {
+            // Keep polling; the cache warm-up may still be underway.
+        }
+        if (state.currentTrack && getTrackRecoveryKey(state.currentTrack) === trackKey && playbackIntentPlaying) {
+            schedulePhoneStreamCacheHandoff(track);
+        }
+    }, STREAM_CACHE_HANDOFF_POLL_MS);
+}
+
 function coverArtUrl(entry, size = 700) {
     const id = entry?.coverArt || entry?.albumId || entry?.id;
     if (!id) {
@@ -967,7 +1218,17 @@ function streamUrl(trackId) {
 }
 
 function playbackUrl(track) {
-    return track?.previewUrl || track?.streamUrl || streamUrl(track?.id);
+    if (track?.previewUrl || track?.streamUrl) {
+        return track.previewUrl || track.streamUrl;
+    }
+    if (!isServerCachedTrack(track)) {
+        return streamUrl(track?.id);
+    }
+    return buildServerApiUrl(
+        "/api/cache/navidrome/stream",
+        { id: track?.id, format: "mp3", maxBitRate: 320 },
+        { expectsJson: false }
+    );
 }
 
 function normalizeAlbum(album) {
@@ -1313,6 +1574,26 @@ function normalizeIdentityText(value) {
     return pickText(value).trim().toLocaleLowerCase();
 }
 
+function normalizeAlbumGroupTitle(value) {
+    return pickText(value)
+        .normalize("NFKC")
+        .replace(/[\u200B-\u200D\uFEFF]/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLocaleLowerCase();
+}
+
+function isUnknownAlbumTitle(value) {
+    const title = normalizeAlbumGroupTitle(value);
+    return !title || [
+        "unknown",
+        "unknown album",
+        "untitled",
+        "untitled album",
+        "no album",
+    ].includes(title);
+}
+
 function tracksReferToSameSong(left, right) {
     if (!left || !right) {
         return false;
@@ -1456,23 +1737,27 @@ async function buildAlbumGroupEntries(tracks, { source, contextId = source } = {
 }
 
 function albumShelfGroupKey({ title = "", fallback = "" } = {}) {
-    const albumTitle = pickText(title);
-    if (albumTitle && albumTitle !== "Unknown Album") {
-        return `album-shelf:${albumTitle.toLowerCase()}`;
+    const albumTitle = normalizeAlbumGroupTitle(title);
+    if (albumTitle && albumTitle !== "unknown album") {
+        return `album-shelf:${albumTitle}`;
     }
     return `fallback:${pickText(fallback)}`;
 }
 
 function songAlbumGroupKey(track) {
-    const albumTitle = pickText(track?.album);
-    if (albumTitle && albumTitle !== "Unknown Album") {
-        return `song-album-title:${albumTitle.toLowerCase()}`;
+    const albumTitle = normalizeAlbumGroupTitle(track?.album);
+    if (albumTitle && albumTitle !== "unknown album") {
+        return `song-album-title:${albumTitle}`;
     }
     const albumId = pickText(track?.albumId);
     if (albumId) {
         return `song-album-id:${albumId}`;
     }
-    return `song-fallback:${pickText(track?.coverArt, track?.id)}`;
+    const coverArt = pickText(track?.coverArt);
+    if (coverArt) {
+        return `song-cover:${coverArt}`;
+    }
+    return `song-fallback:${pickText(track?.id, track?.title)}`;
 }
 
 function groupAlbumEntriesByTitle(entries) {
@@ -2440,17 +2725,69 @@ function getBrowseEntryCacheKey(mode = state.browseMode) {
     }
 }
 
+function browseModeFromCacheKey(cacheKey = "") {
+    return decodeURIComponent(String(cacheKey).split("|", 1)[0] || "");
+}
+
+function isSearchResultEntry(entry) {
+    return entry?.source === BROWSE_MODE.SEARCH || String(entry?.key || "").startsWith("song:search:");
+}
+
+function entryMatchesBrowseCacheMode(mode, entry) {
+    switch (mode) {
+        case BROWSE_MODE.ALBUM:
+        case BROWSE_MODE.YEAR:
+        case BROWSE_MODE.GENRE:
+        case BROWSE_MODE.RATING:
+            return entry?.kind === "album";
+        case BROWSE_MODE.RADIO:
+            return entry?.kind === "radio";
+        default:
+            return true;
+    }
+}
+
+function isBrowseCacheValueValid(cacheKey, value) {
+    if (!value || !Array.isArray(value.entries)) {
+        return false;
+    }
+    if (value.cacheSchema !== BROWSE_CACHE_SCHEMA_VERSION) {
+        return false;
+    }
+    const expectedMode = browseModeFromCacheKey(cacheKey);
+    if (value.mode && value.mode !== expectedMode) {
+        return false;
+    }
+    return value.entries.every((entry) =>
+        !isSearchResultEntry(entry) && entryMatchesBrowseCacheMode(expectedMode, entry)
+    );
+}
+
 function getBrowseEntryCache(cacheKey = getBrowseEntryCacheKey()) {
     const key = cacheKey;
-    return key ? browseEntryCache.get(key) || null : null;
+    if (!key) {
+        return null;
+    }
+    const cached = browseEntryCache.get(key) || null;
+    if (!cached) {
+        return null;
+    }
+    if (!isBrowseCacheValueValid(key, cached)) {
+        browseEntryCache.delete(key);
+        deletePersistentBrowseEntryCaches(browseModeFromCacheKey(key));
+        return null;
+    }
+    return cached;
 }
 
 function setBrowseEntryCache(cacheKey = activeBrowseEntryCacheKey) {
     const key = cacheKey;
-    if (!key) {
+    if (!key || state.browseMode === BROWSE_MODE.SEARCH) {
         return;
     }
     const cacheValue = {
+        cacheSchema: BROWSE_CACHE_SCHEMA_VERSION,
+        mode: browseModeFromCacheKey(key),
         entries: browseEntries.slice(),
         browseIndex: clamp(state.browseIndex, 0, Math.max(0, browseEntries.length - 1)),
         activeEntryKey: state.activeEntryKey || "",
@@ -2464,6 +2801,11 @@ function setBrowseEntryCache(cacheKey = activeBrowseEntryCacheKey) {
             }
             : null,
     };
+    if (!isBrowseCacheValueValid(key, cacheValue)) {
+        browseEntryCache.delete(key);
+        deletePersistentBrowseEntryCaches(browseModeFromCacheKey(key));
+        return;
+    }
     browseEntryCache.delete(key);
     browseEntryCache.set(key, cacheValue);
     markPersistentBrowseCacheFresh(key);
@@ -2503,6 +2845,14 @@ function invalidateLibraryCaches({ persistent = true } = {}) {
     textureLoadPromises.clear();
     radioCoverLookupPromises.clear();
     playlistMembershipCache.clear();
+    streamCacheReadyKeys.clear();
+    streamCacheHandoffDoneKeys.clear();
+    clearStreamCacheHandoffTimer();
+    albumDetailsLoadPromises.clear();
+    if (drawerDetailPrefetchTimerId) {
+        window.clearTimeout(drawerDetailPrefetchTimerId);
+        drawerDetailPrefetchTimerId = 0;
+    }
     state.detailsCache.clear();
     state.artistOptions = [];
     state.albumArtistOptions = [];
@@ -2518,23 +2868,79 @@ async function ensureAlbumDetails(albumId) {
     if (state.detailsCache.has(key)) {
         return state.detailsCache.get(key);
     }
-    const payload = await fetchJson("/rest/getAlbum.view", { id: albumId });
-    const album = normalizeAlbum(payload.album || {});
-    album.tracks = ensureArray(payload.album?.song).map((track, index) =>
-        normalizeTrack(track, {
-            source: "album",
-            contextId: album.id,
-            albumId: album.id,
-            albumTitle: album.title,
-            artist: album.artist,
-            coverArt: album.coverArt || album.id,
-            year: album.year,
-            key: `song:album:${album.id}:${track.id || index}`,
-            index,
-        })
-    );
-    state.detailsCache.set(key, album);
-    return album;
+    if (albumDetailsLoadPromises.has(key)) {
+        return albumDetailsLoadPromises.get(key);
+    }
+    const loadPromise = (async () => {
+        const payload = await fetchServerCachedJson("/api/cache/navidrome/album", { id: albumId });
+        const album = normalizeAlbum(payload.album || {});
+        album.tracks = ensureArray(payload.album?.song).map((track, index) =>
+            normalizeTrack(track, {
+                source: "album",
+                contextId: album.id,
+                albumId: album.id,
+                albumTitle: album.title,
+                artist: album.artist,
+                coverArt: album.coverArt || album.id,
+                year: album.year,
+                key: `song:album:${album.id}:${track.id || index}`,
+                index,
+            })
+        );
+        state.detailsCache.set(key, album);
+        return album;
+    })().finally(() => {
+        albumDetailsLoadPromises.delete(key);
+    });
+    albumDetailsLoadPromises.set(key, loadPromise);
+    return loadPromise;
+}
+
+function albumDetailIdsForEntry(entry) {
+    if (!entry || Array.isArray(entry.groupTracks)) {
+        return [];
+    }
+    if (Array.isArray(entry.groupAlbumIds) && entry.groupAlbumIds.length) {
+        return entry.groupAlbumIds.filter(Boolean).map(String);
+    }
+    const albumId = pickText(entry.drawerAlbumId, entry.albumId, entry.kind === "album" ? entry.id : "");
+    return albumId ? [albumId] : [];
+}
+
+function prefetchAlbumDetailIds(albumIds) {
+    const uniqueIds = [...new Set(albumIds.map(String).filter(Boolean))];
+    warmServerAlbumDetails(uniqueIds);
+    for (const albumId of uniqueIds.slice(0, DRAWER_DETAIL_PREFETCH_MAX_ALBUMS)) {
+        const key = `album:${albumId}`;
+        if (state.detailsCache.has(key) || albumDetailsLoadPromises.has(key)) {
+            continue;
+        }
+        ensureAlbumDetails(albumId).catch(() => {});
+    }
+}
+
+function scheduleDrawerDetailPrefetch(centerIndex = state.browseIndex) {
+    if (!state.connected || !browseEntries.length) {
+        return;
+    }
+    if (drawerDetailPrefetchTimerId) {
+        window.clearTimeout(drawerDetailPrefetchTimerId);
+    }
+    drawerDetailPrefetchTimerId = window.setTimeout(() => {
+        drawerDetailPrefetchTimerId = 0;
+        const center = clamp(centerIndex, 0, Math.max(0, browseEntries.length - 1));
+        const radius = clamp(DRAWER_DETAIL_PREFETCH_RADIUS, 1, Math.max(1, browseEntries.length));
+        const lo = Math.max(0, center - radius);
+        const hi = Math.min(browseEntries.length - 1, center + radius);
+        const ids = [];
+        for (const index of getTexturePreloadOrder(center, lo, hi)) {
+            ids.push(...albumDetailIdsForEntry(browseEntries[index]));
+            if (ids.length >= DRAWER_DETAIL_PREFETCH_MAX_ALBUMS) {
+                break;
+            }
+        }
+        prefetchAlbumDetailIds(ids);
+    }, 300);
 }
 
 async function ensurePlaylistDetails(playlistId) {
@@ -3468,19 +3874,19 @@ function renderTrackDisplayModeOptions(mode, actionName) {
 function renderSortOptions(sort, actionName) {
     const activeSort = normalizeBrowseSort(sort);
     return `
-        <button class="browse-dropdown-item browse-dropdown-display-mode ${activeSort === "year-asc" ? "is-selected" : ""}" data-sort-action="${actionName}" data-sort-mode="year-asc">
-            <span class="browse-dropdown-label-row">
-                <span class="browse-dropdown-label">Year: Low to High</span>
-                ${renderDropdownCheck(activeSort === "year-asc")}
-            </span>
-            <span class="browse-dropdown-meta">Oldest first</span>
-        </button>
         <button class="browse-dropdown-item browse-dropdown-display-mode ${activeSort === "year-desc" ? "is-selected" : ""}" data-sort-action="${actionName}" data-sort-mode="year-desc">
             <span class="browse-dropdown-label-row">
                 <span class="browse-dropdown-label">Year: High to Low</span>
                 ${renderDropdownCheck(activeSort === "year-desc")}
             </span>
             <span class="browse-dropdown-meta">Newest first</span>
+        </button>
+        <button class="browse-dropdown-item browse-dropdown-display-mode ${activeSort === "year-asc" ? "is-selected" : ""}" data-sort-action="${actionName}" data-sort-mode="year-asc">
+            <span class="browse-dropdown-label-row">
+                <span class="browse-dropdown-label">Year: Low to High</span>
+                ${renderDropdownCheck(activeSort === "year-asc")}
+            </span>
+            <span class="browse-dropdown-meta">Oldest first</span>
         </button>
         <button class="browse-dropdown-item browse-dropdown-display-mode ${activeSort === "title" ? "is-selected" : ""}" data-sort-action="${actionName}" data-sort-mode="title">
             <span class="browse-dropdown-label-row">
@@ -4013,7 +4419,20 @@ function browseSortText(entry) {
     return pickText(entry?.title, entry?.album, entry?.artist, "").trim();
 }
 
+function compareUnknownAlbumsLast(left, right) {
+    const leftUnknown = left?.kind === "album" && isUnknownAlbumTitle(left.title);
+    const rightUnknown = right?.kind === "album" && isUnknownAlbumTitle(right.title);
+    if (leftUnknown === rightUnknown) {
+        return 0;
+    }
+    return leftUnknown ? 1 : -1;
+}
+
 function compareBrowseEntriesAtoZ(left, right) {
+    const unknownOrder = compareUnknownAlbumsLast(left, right);
+    if (unknownOrder !== 0) {
+        return unknownOrder;
+    }
     const primary = alphaCollator.compare(browseSortText(left), browseSortText(right));
     if (primary !== 0) {
         return primary;
@@ -4035,6 +4454,10 @@ function parseYearForSort(value) {
 }
 
 function compareBrowseEntriesByYear(left, right, direction = 1) {
+    const unknownOrder = compareUnknownAlbumsLast(left, right);
+    if (unknownOrder !== 0) {
+        return unknownOrder;
+    }
     const leftYear = parseYearForSort(left?.year);
     const rightYear = parseYearForSort(right?.year);
     if (leftYear == null && rightYear == null) {
@@ -4052,15 +4475,6 @@ function compareBrowseEntriesByYear(left, right, direction = 1) {
     return compareBrowseEntriesAtoZ(left, right);
 }
 
-function compareUnknownAlbumsLast(left, right) {
-    const leftUnknown = left?.kind === "album" && normalizeIdentityText(left.title) === "unknown album";
-    const rightUnknown = right?.kind === "album" && normalizeIdentityText(right.title) === "unknown album";
-    if (leftUnknown === rightUnknown) {
-        return 0;
-    }
-    return leftUnknown ? 1 : -1;
-}
-
 function sortBrowseEntriesForCurrentMode(entries) {
     const sortKey =
         state.browseMode === BROWSE_MODE.SONGS
@@ -4073,20 +4487,13 @@ function sortBrowseEntriesForCurrentMode(entries) {
                         ? normalizeBrowseSort(state.settings.playlistBrowseSort)
                         : "title";
 
-    const compareWithUnknownAlbumsLast = (compareEntries) => (left, right) =>
-        compareUnknownAlbumsLast(left, right) || compareEntries(left, right);
-
     if (sortKey === "year-asc") {
-        return [...entries].sort(compareWithUnknownAlbumsLast(
-            (left, right) => compareBrowseEntriesByYear(left, right, 1)
-        ));
+        return [...entries].sort((left, right) => compareBrowseEntriesByYear(left, right, 1));
     }
     if (sortKey === "year-desc") {
-        return [...entries].sort(compareWithUnknownAlbumsLast(
-            (left, right) => compareBrowseEntriesByYear(left, right, -1)
-        ));
+        return [...entries].sort((left, right) => compareBrowseEntriesByYear(left, right, -1));
     }
-    return [...entries].sort(compareWithUnknownAlbumsLast(compareBrowseEntriesAtoZ));
+    return [...entries].sort(compareBrowseEntriesAtoZ);
 }
 
 function sortDrawerItemsAtoZ(items) {
@@ -4832,6 +5239,7 @@ function ensureTextures(centerIndex = state.browseIndex) {
     for (const index of getTexturePreloadOrder(center, lo, hi)) {
         ensureTextureAtIndex(index);
     }
+    scheduleDrawerDetailPrefetch(center);
 }
 
 function getTexturePreloadOrder(center, lo, hi) {
@@ -5501,7 +5909,7 @@ function renderSongsDrawer() {
             const playlistPickerOpen = menuOpen && state.activeSongMenuMode === "playlist-picker";
             const canRemoveFromPlaylist = Boolean(state.drawerContext.playlistId);
             const subject = { type: "song", track };
-            const displayNr = track?.trackNo || index + 1;
+            const displayNr = context.playlistId ? rowIndex + 1 : track?.trackNo || index + 1;
             const currentStatusLabel = playbackState.playing ? "Now playing" : "Current track";
             const rowNumberHtml = isCurrent
                 ? `
@@ -5741,17 +6149,19 @@ async function showMoreInfoForSubject(subject, index = 0) {
 
 async function setSongsDrawerOpen(open) {
     state.drawerOpen = open;
+    elements.songsDrawer.classList.toggle("is-open", open);
+    elements.songsDrawerBackdrop.classList.toggle("is-open", open);
+    elements.songsDrawer.setAttribute("aria-hidden", String(!open));
     if (open) {
         state.activeDropdown = null;
+        renderBrowseMenus();
+        renderSongsDrawer();
         await ensureDrawerContext();
     } else {
         state.activeSongMenuIndex = null;
         state.activeSongMenuMode = "actions";
         hideSongInfo();
     }
-    elements.songsDrawer.classList.toggle("is-open", open);
-    elements.songsDrawerBackdrop.classList.toggle("is-open", open);
-    elements.songsDrawer.setAttribute("aria-hidden", String(!open));
     renderBrowseMenus();
     renderSongsDrawer();
 }
@@ -6223,9 +6633,19 @@ async function playTrackList(tracks, index, queueKey) {
     playbackState.elapsed = 0;
     playbackState.duration = state.currentTrack.duration || 0;
     playbackState.timelineUpdatedAt = Date.now();
+    streamRecoveryTrackKey = getTrackRecoveryKey(state.currentTrack);
+    streamRecoveryAttempts = 0;
+    window.clearTimeout(seekRetryTimerId);
+    seekRetryTimerId = 0;
+    clearStreamCacheHandoffTimer();
+    seekPrepareId += 1;
 
+    elements.audioPlayer.preload = "auto";
     elements.audioPlayer.src = playbackUrl(state.currentTrack);
     elements.audioPlayer.load();
+    warmServerStreamCache(state.currentTrack);
+    playbackIntentPlaying = true;
+    schedulePhoneStreamCacheHandoff(state.currentTrack);
 
     try {
         await elements.audioPlayer.play();
@@ -6233,6 +6653,7 @@ async function playTrackList(tracks, index, queueKey) {
         if (error?.name === "AbortError") {
             // Benign: play() was superseded by a newer pause()/load(), e.g. user clicked another track quickly.
         } else {
+            playbackIntentPlaying = false;
             console.error(error);
             flashStatus("Browser playback was blocked.", 2200);
         }
@@ -6248,12 +6669,16 @@ async function cmdPlayPause() {
     // from accidentally starting a new track when the user browsed away.
     if (state.currentTrack && elements.audioPlayer.src) {
         if (elements.audioPlayer.paused) {
+            playbackIntentPlaying = true;
             await elements.audioPlayer.play().catch((error) => {
                 if (error?.name !== "AbortError") {
+                    playbackIntentPlaying = false;
                     flashStatus("Browser playback was blocked.", 2200);
                 }
             });
         } else {
+            playbackIntentPlaying = false;
+            clearStreamCacheHandoffTimer();
             elements.audioPlayer.pause();
         }
         return;
@@ -6317,6 +6742,8 @@ async function cmdNext() {
         if (await playAdjacentBrowseEntry(state.currentTrack, 1)) {
             return;
         }
+        playbackIntentPlaying = false;
+        clearStreamCacheHandoffTimer();
         elements.audioPlayer.pause();
         elements.audioPlayer.currentTime = 0;
         playbackState.playing = false;
@@ -6356,6 +6783,129 @@ function didAudioEndEarly() {
     return expectedDuration > 30 && elapsed > 0 && elapsed < expectedDuration - 8;
 }
 
+function getTrackRecoveryKey(track = state.currentTrack) {
+    return pickText(track?.id, track?.streamUrl, track?.previewUrl, track?.key);
+}
+
+function setAudioCurrentTime(seconds) {
+    if (!Number.isFinite(seconds)) {
+        return elements.audioPlayer.currentTime || 0;
+    }
+    const duration = getSeekDuration();
+    const target = duration > 0 ? clamp(seconds, 0, duration) : Math.max(0, seconds);
+    try {
+        if (typeof elements.audioPlayer.fastSeek === "function") {
+            elements.audioPlayer.fastSeek(target);
+        } else {
+            elements.audioPlayer.currentTime = target;
+        }
+    } catch {
+        elements.audioPlayer.currentTime = target;
+    }
+    playbackState.elapsed = target;
+    playbackState.timelineUpdatedAt = Date.now();
+    updatePlaybackStripUI();
+    return target;
+}
+
+function waitForAudioReady(timeoutMs = 1800) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const done = () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            window.clearTimeout(timeoutId);
+            elements.audioPlayer.removeEventListener("loadedmetadata", done);
+            elements.audioPlayer.removeEventListener("canplay", done);
+            resolve();
+        };
+        const timeoutId = window.setTimeout(done, timeoutMs);
+        elements.audioPlayer.addEventListener("loadedmetadata", done, { once: true });
+        elements.audioPlayer.addEventListener("canplay", done, { once: true });
+    });
+}
+
+function scheduleSeekCommitCheck(target, wasPlaying) {
+    const trackKey = getTrackRecoveryKey();
+    if (!trackKey || state.currentTrack?.kind === "radio") {
+        return;
+    }
+    const prepareId = seekPrepareId;
+    window.clearTimeout(seekRetryTimerId);
+    seekRetryTimerId = window.setTimeout(async () => {
+        seekRetryTimerId = 0;
+        if (!state.currentTrack || getTrackRecoveryKey() !== trackKey) {
+            return;
+        }
+        const current = Number(elements.audioPlayer.currentTime || 0);
+        if (Math.abs(current - target) < 2 || elements.audioPlayer.seeking) {
+            return;
+        }
+        if (isServerCachedTrack(state.currentTrack)) {
+            const ready = await waitForServerStreamCacheReady(state.currentTrack, prepareId);
+            if (!ready || prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey) {
+                return;
+            }
+        }
+        elements.audioPlayer.preload = "auto";
+        elements.audioPlayer.src = playbackUrl(state.currentTrack);
+        elements.audioPlayer.load();
+        await waitForAudioReady(3200);
+        if (!state.currentTrack || getTrackRecoveryKey() !== trackKey) {
+            return;
+        }
+        setAudioCurrentTime(target);
+        if (wasPlaying) {
+            await elements.audioPlayer.play().catch((error) => {
+                if (error?.name !== "AbortError") {
+                    flashStatus("Browser playback was blocked.", 2200);
+                }
+            });
+        }
+    }, 1200);
+}
+
+async function recoverInterruptedTrackPlayback() {
+    const track = state.currentTrack;
+    if (!track || track.kind === "radio") {
+        return false;
+    }
+    const trackKey = getTrackRecoveryKey(track);
+    if (!trackKey) {
+        return false;
+    }
+    if (streamRecoveryTrackKey !== trackKey) {
+        streamRecoveryTrackKey = trackKey;
+        streamRecoveryAttempts = 0;
+    }
+    if (streamRecoveryAttempts >= 2) {
+        return false;
+    }
+    streamRecoveryAttempts += 1;
+
+    const resumeAt = Math.max(
+        0,
+        Number(elements.audioPlayer.currentTime || playbackState.elapsed || 0) + 0.75
+    );
+    elements.audioPlayer.preload = "auto";
+    elements.audioPlayer.src = playbackUrl(track);
+    elements.audioPlayer.load();
+    await waitForAudioReady();
+    setAudioCurrentTime(resumeAt);
+    try {
+        await elements.audioPlayer.play();
+        flashStatus("Resuming cached stream...", 1400);
+        return true;
+    } catch (error) {
+        if (error?.name !== "AbortError") {
+            console.error(error);
+        }
+        return false;
+    }
+}
+
 async function cmdSeek(seconds) {
     if (!Number.isFinite(seconds)) {
         return;
@@ -6364,10 +6914,48 @@ async function cmdSeek(seconds) {
     if (duration <= 0) {
         return;
     }
-    elements.audioPlayer.currentTime = clamp(seconds, 0, duration);
-    playbackState.elapsed = elements.audioPlayer.currentTime;
+    const trackAtSeek = state.currentTrack;
+    const trackKey = getTrackRecoveryKey(trackAtSeek);
+    const prepareId = seekPrepareId + 1;
+    seekPrepareId = prepareId;
+    const shouldResume = !elements.audioPlayer.paused || playbackIntentPlaying;
+    const target = clamp(seconds, 0, duration);
+    playbackState.elapsed = target;
     playbackState.timelineUpdatedAt = Date.now();
     updatePlaybackStripUI();
+
+    const cacheKey = serverStreamCacheKey(trackAtSeek);
+    if (cacheKey && !streamCacheReadyKeys.has(cacheKey)) {
+        flashStatus("Seeking...", 1800);
+        const ready = await waitForServerStreamCacheReady(trackAtSeek, prepareId);
+        if (prepareId !== seekPrepareId || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
+            return;
+        }
+        if (!ready) {
+            flashStatus("Still seeking...", 2200);
+            scheduleSeekCommitCheck(target, shouldResume);
+            return;
+        }
+        elements.audioPlayer.preload = "auto";
+        elements.audioPlayer.src = playbackUrl(trackAtSeek);
+        elements.audioPlayer.load();
+        await waitForAudioReady(3200);
+        if (prepareId !== seekPrepareId || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
+            return;
+        }
+    }
+
+    setAudioCurrentTime(target);
+    scheduleSeekCommitCheck(target, shouldResume);
+    if (shouldResume) {
+        playbackIntentPlaying = true;
+        await elements.audioPlayer.play().catch((error) => {
+            if (error?.name !== "AbortError") {
+                playbackIntentPlaying = false;
+                flashStatus("Browser playback was blocked.", 2200);
+            }
+        });
+    }
 }
 
 function syncVolumeFromSlider() {
@@ -6871,27 +7459,45 @@ function waitForNextPaint() {
     });
 }
 
-function isUserInspectingLibraryItem() {
+function isUserInspectingLibraryItem({ ignoreDropdown = false } = {}) {
     const infoPanelOpen = !elements.songInfoModal.classList.contains("hidden");
     return Boolean(
         infoPanelOpen ||
         state.infoTrackIndex != null ||
         state.activeInfoMenuMode !== "closed" ||
         state.drawerOpen ||
-        state.activeDropdown ||
+        (!ignoreDropdown && state.activeDropdown) ||
         state.searchOpen
     );
 }
 
 function scheduleSnapBackToPlaying() {
     clearSnapBackTimer();
+    const currentTrackIsRadio = state.currentTrack?.kind === "radio";
+    const shouldReturnToRadio = currentTrackIsRadio && state.browseMode !== BROWSE_MODE.RADIO;
+    const ignoreDropdownForRadioReturn = shouldReturnToRadio;
     if (
-        isUserInspectingLibraryItem() ||
+        isUserInspectingLibraryItem({ ignoreDropdown: ignoreDropdownForRadioReturn }) ||
         state.browseMode === BROWSE_MODE.SEARCH ||
         !state.currentTrack ||
         !elements.audioPlayer ||
         elements.audioPlayer.paused
     ) {
+        return;
+    }
+    if (shouldReturnToRadio) {
+        snapBackTimerId = window.setTimeout(async () => {
+            snapBackTimerId = 0;
+            if (
+                !state.currentTrack ||
+                state.currentTrack.kind !== "radio" ||
+                elements.audioPlayer.paused ||
+                isUserInspectingLibraryItem({ ignoreDropdown: true })
+            ) {
+                return;
+            }
+            await setBrowseMode(BROWSE_MODE.RADIO, { animate: true, activeDropdown: null });
+        }, 5000);
         return;
     }
     const playingKey = keyForTrackInCurrentMode(state.currentTrack);
@@ -7100,16 +7706,18 @@ function scheduleRadioPreviewReconnect() {
 }
 
 function setupAudio() {
-    elements.audioPlayer.preload = "metadata";
+    elements.audioPlayer.preload = "auto";
     elements.audioPlayer.volume = 1;
 
     elements.audioPlayer.addEventListener("play", () => {
         window.clearTimeout(radioPreviewReconnectTimer);
         radioPreviewReconnectTimer = 0;
+        playbackIntentPlaying = true;
         playbackState.playing = true;
         playbackState.timelineUpdatedAt = Date.now();
         updateUI();
         scheduleSnapBackToPlaying();
+        schedulePhoneStreamCacheHandoff(state.currentTrack);
     });
 
     elements.audioPlayer.addEventListener("pause", () => {
@@ -7140,11 +7748,15 @@ function setupAudio() {
         updatePlaybackStripUI();
     });
 
-    elements.audioPlayer.addEventListener("ended", () => {
+    elements.audioPlayer.addEventListener("ended", async () => {
         if (scheduleRadioPreviewReconnect()) {
             return;
         }
         if (didAudioEndEarly()) {
+            if (await recoverInterruptedTrackPlayback()) {
+                return;
+            }
+            playbackIntentPlaying = false;
             playbackState.playing = false;
             updatePlaybackStripUI();
             flashStatus("Stream ended early. Press play to resume this track.", 2400);
@@ -7153,10 +7765,14 @@ function setupAudio() {
         cmdNext();
     });
 
-    elements.audioPlayer.addEventListener("error", () => {
+    elements.audioPlayer.addEventListener("error", async () => {
         if (scheduleRadioPreviewReconnect()) {
             return;
         }
+        if (await recoverInterruptedTrackPlayback()) {
+            return;
+        }
+        playbackIntentPlaying = false;
         flashStatus("Could not stream the selected track.", 2400);
     });
 }

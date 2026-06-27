@@ -1,10 +1,10 @@
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, rename, stat, unlink } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const rootDir = fileURLToPath(new URL(".", import.meta.url));
@@ -25,6 +25,14 @@ const radioSearchCache = new Map();
 const radioSearchCacheTtlMs = 5 * 60 * 1000;
 const communityRadioStreams = new Map();
 const communityRadioStreamTtlMs = 60 * 60 * 1000;
+const navidromeAlbumCache = new Map();
+const navidromeAlbumInflight = new Map();
+const navidromeAlbumCacheTtlMs = Number(process.env.ALBUM_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
+const navidromeAlbumCacheMaxItems = Number(process.env.ALBUM_CACHE_MAX_ITEMS || 5000);
+const navidromeAlbumWarmMaxItems = Number(process.env.ALBUM_CACHE_WARM_MAX_ITEMS || 32);
+const audioCacheDir = process.env.AUDIO_CACHE_DIR || join(rootDir, ".cache", "audio");
+const audioCacheInflight = new Map();
+const audioCacheSeekWaitMs = Number(process.env.AUDIO_CACHE_SEEK_WAIT_MS || 12000);
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -52,6 +60,378 @@ function getNavidromeTarget(rawOrigin) {
   } catch {
     return new URL(defaultNavidromeOrigin);
   }
+}
+
+function navidromeScopeFromRequest(requestUrl) {
+  const origin = getNavidromeTarget(
+    allowClientOriginOverride ? requestUrl.searchParams.get("__origin") : ""
+  );
+  const user = String(requestUrl.searchParams.get("u") || "").trim().toLocaleLowerCase();
+  return `${origin.toString()}|${user}`;
+}
+
+function navidromeAlbumCacheKey(requestUrl, albumId) {
+  return `${navidromeScopeFromRequest(requestUrl)}|album:${albumId}`;
+}
+
+function pruneNavidromeAlbumCache() {
+  if (navidromeAlbumCache.size <= navidromeAlbumCacheMaxItems) {
+    return;
+  }
+  const records = [...navidromeAlbumCache.entries()]
+    .sort((left, right) => Number(left[1].lastUsed || 0) - Number(right[1].lastUsed || 0));
+  for (const [key] of records.slice(0, Math.max(0, records.length - navidromeAlbumCacheMaxItems))) {
+    navidromeAlbumCache.delete(key);
+  }
+}
+
+function buildNavidromeUrlFromClientRequest(requestUrl, path) {
+  const origin = getNavidromeTarget(
+    allowClientOriginOverride ? requestUrl.searchParams.get("__origin") : ""
+  );
+  const upstreamParams = new URLSearchParams(requestUrl.searchParams);
+  upstreamParams.delete("__origin");
+  upstreamParams.delete("ids");
+  const originBasePath = origin.pathname.replace(/\/$/, "");
+  const upstreamPath = `${originBasePath}${path}`.replace(/\/{2,}/g, "/");
+  const upstreamUrl = new URL(upstreamPath, origin);
+  upstreamUrl.search = upstreamParams.toString();
+  return upstreamUrl;
+}
+
+async function fetchNavidromeJsonFromClientRequest(requestUrl, path) {
+  const payload = await requestJson(buildNavidromeUrlFromClientRequest(requestUrl, path));
+  const envelope = payload?.["subsonic-response"];
+  if (!envelope || envelope.status !== "ok") {
+    const message = envelope?.error?.message || payload?.error || "Navidrome request failed";
+    throw new Error(message);
+  }
+  return payload;
+}
+
+async function getCachedNavidromeAlbum(requestUrl, albumId) {
+  const key = navidromeAlbumCacheKey(requestUrl, albumId);
+  const now = Date.now();
+  const cached = navidromeAlbumCache.get(key);
+  if (cached && now - cached.createdAt < navidromeAlbumCacheTtlMs) {
+    cached.lastUsed = now;
+    return cached.payload;
+  }
+  if (navidromeAlbumInflight.has(key)) {
+    return navidromeAlbumInflight.get(key);
+  }
+
+  const albumRequestUrl = new URL(requestUrl.toString());
+  albumRequestUrl.searchParams.set("id", albumId);
+  const loadPromise = fetchNavidromeJsonFromClientRequest(albumRequestUrl, "/rest/getAlbum.view")
+    .then((payload) => {
+      navidromeAlbumCache.set(key, { createdAt: Date.now(), lastUsed: Date.now(), payload });
+      pruneNavidromeAlbumCache();
+      return payload;
+    })
+    .finally(() => {
+      navidromeAlbumInflight.delete(key);
+    });
+  navidromeAlbumInflight.set(key, loadPromise);
+  return loadPromise;
+}
+
+function warmCachedNavidromeAlbums(requestUrl, albumIds) {
+  const uniqueIds = [...new Set(albumIds.map((id) => String(id || "").trim()).filter(Boolean))]
+    .slice(0, navidromeAlbumWarmMaxItems);
+  for (const albumId of uniqueIds) {
+    const key = navidromeAlbumCacheKey(requestUrl, albumId);
+    const cached = navidromeAlbumCache.get(key);
+    if (cached && Date.now() - cached.createdAt < navidromeAlbumCacheTtlMs) {
+      cached.lastUsed = Date.now();
+      continue;
+    }
+    if (navidromeAlbumInflight.has(key)) {
+      continue;
+    }
+    getCachedNavidromeAlbum(requestUrl, albumId).catch(() => {});
+  }
+  return uniqueIds.length;
+}
+
+function audioCacheInfoFromRequest(requestUrl) {
+  const trackId = String(requestUrl.searchParams.get("id") || "").trim();
+  if (!trackId) {
+    return null;
+  }
+  const format = String(requestUrl.searchParams.get("format") || "mp3").trim().toLowerCase();
+  const maxBitRate = String(requestUrl.searchParams.get("maxBitRate") || "320").trim();
+  const scope = navidromeScopeFromRequest(requestUrl);
+  const digest = createHash("sha256")
+    .update(`${scope}|stream:${trackId}|${format}|${maxBitRate}`)
+    .digest("hex");
+  const extension = format && /^[a-z0-9]{2,5}$/.test(format) ? format : "mp3";
+  return {
+    trackId,
+    format,
+    maxBitRate,
+    key: digest,
+    filePath: join(audioCacheDir, `${digest}.${extension}`),
+    tmpPath: join(audioCacheDir, `${digest}.${process.pid}.tmp`),
+    contentType: extension === "mp3" ? "audio/mpeg" : "application/octet-stream"
+  };
+}
+
+async function cachedAudioReady(info) {
+  try {
+    const fileStats = await stat(info.filePath);
+    return fileStats.isFile() && fileStats.size > 0 ? fileStats : null;
+  } catch {
+    return null;
+  }
+}
+
+function downloadAudioToCache(requestUrl, info) {
+  const existing = audioCacheInflight.get(info.key);
+  if (existing) {
+    return existing;
+  }
+
+  const upstreamUrl = buildNavidromeUrlFromClientRequest(requestUrl, "/rest/stream.view");
+  upstreamUrl.searchParams.set("id", info.trackId);
+  upstreamUrl.searchParams.set("format", info.format || "mp3");
+  upstreamUrl.searchParams.set("maxBitRate", info.maxBitRate || "320");
+  upstreamUrl.searchParams.delete("estimateContentLength");
+
+  const promise = mkdir(audioCacheDir, { recursive: true })
+    .then(() => new Promise((resolve, reject) => {
+      const requestImpl = upstreamUrl.protocol === "https:" ? httpsRequest : httpRequest;
+      const upstreamReq = requestImpl(
+        upstreamUrl,
+        {
+          headers: {
+            accept: "audio/*,*/*;q=0.8",
+            "user-agent": "NaviGlassPlayer/0.1"
+          }
+        },
+        (upstreamRes) => {
+          if ((upstreamRes.statusCode || 500) >= 400) {
+            upstreamRes.resume();
+            reject(new Error(`Navidrome stream returned HTTP ${upstreamRes.statusCode}`));
+            return;
+          }
+          const writer = createWriteStream(info.tmpPath);
+          upstreamRes.pipe(writer);
+          upstreamRes.on("error", reject);
+          writer.on("error", reject);
+          writer.on("finish", resolve);
+        }
+      );
+      upstreamReq.setTimeout(120000, () => {
+        upstreamReq.destroy(new Error("Audio cache download timed out"));
+      });
+      upstreamReq.on("error", reject);
+      upstreamReq.end();
+    }))
+    .then(async () => {
+      await rename(info.tmpPath, info.filePath);
+      return info.filePath;
+    })
+    .catch(async (error) => {
+      await unlink(info.tmpPath).catch(() => {});
+      throw error;
+    })
+    .finally(() => {
+      audioCacheInflight.delete(info.key);
+    });
+
+  audioCacheInflight.set(info.key, promise);
+  return promise;
+}
+
+function parseByteRange(rangeHeader, fileSize) {
+  const match = String(rangeHeader || "").match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) {
+    return null;
+  }
+  let start = match[1] ? Number(match[1]) : 0;
+  let end = match[2] ? Number(match[2]) : fileSize - 1;
+  if (!match[1] && match[2]) {
+    const suffixLength = Number(match[2]);
+    start = Math.max(0, fileSize - suffixLength);
+    end = fileSize - 1;
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= fileSize) {
+    return null;
+  }
+  return { start, end: Math.min(end, fileSize - 1) };
+}
+
+function requestedRangeStart(rangeHeader) {
+  const match = String(rangeHeader || "").match(/^bytes=(\d*)-(\d*)$/);
+  if (!match || !match[1]) {
+    return 0;
+  }
+  const start = Number(match[1]);
+  return Number.isFinite(start) ? start : 0;
+}
+
+async function waitForCachedAudio(info, timeoutMs = audioCacheSeekWaitMs) {
+  const cachePromise = audioCacheInflight.get(info.key);
+  if (!cachePromise) {
+    return null;
+  }
+  try {
+    await Promise.race([
+      cachePromise,
+      new Promise((resolve) => setTimeout(resolve, timeoutMs))
+    ]);
+  } catch {
+    return null;
+  }
+  return cachedAudioReady(info);
+}
+
+function serveCachedAudioFile(req, res, info, fileSize) {
+  const range = parseByteRange(req.headers.range, fileSize);
+  const headers = {
+    "content-type": info.contentType,
+    "accept-ranges": "bytes",
+    "cache-control": "private, max-age=86400"
+  };
+
+  if (req.headers.range && !range) {
+    res.writeHead(416, {
+      ...headers,
+      "content-range": `bytes */${fileSize}`
+    });
+    res.end();
+    return;
+  }
+
+  if (range) {
+    const contentLength = range.end - range.start + 1;
+    res.writeHead(206, {
+      ...headers,
+      "content-length": contentLength,
+      "content-range": `bytes ${range.start}-${range.end}/${fileSize}`
+    });
+    if (req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    createReadStream(info.filePath, { start: range.start, end: range.end }).pipe(res);
+    return;
+  }
+
+  res.writeHead(200, {
+    ...headers,
+    "content-length": fileSize
+  });
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  createReadStream(info.filePath).pipe(res);
+}
+
+function proxyAudioToNavidrome(req, res, requestUrl) {
+  const upstreamUrl = buildNavidromeUrlFromClientRequest(requestUrl, "/rest/stream.view");
+  const requestImpl = upstreamUrl.protocol === "https:" ? httpsRequest : httpRequest;
+  const headers = { ...req.headers };
+  delete headers.host;
+  delete headers.connection;
+
+  const upstreamReq = requestImpl(
+    upstreamUrl,
+    {
+      method: req.method,
+      headers
+    },
+    (proxyRes) => {
+      const responseHeaders = { ...proxyRes.headers };
+      delete responseHeaders["content-security-policy"];
+      responseHeaders["accept-ranges"] = responseHeaders["accept-ranges"] || "bytes";
+      responseHeaders["cache-control"] = "no-store";
+      res.writeHead(proxyRes.statusCode || 502, responseHeaders);
+      proxyRes.pipe(res);
+      proxyRes.on("error", (error) => {
+        if (!res.headersSent) {
+          writeJson(res, 502, {
+            error: "Interrupted Navidrome stream",
+            details: error.message
+          });
+        } else {
+          res.destroy(error);
+        }
+      });
+    }
+  );
+
+  upstreamReq.on("error", (error) => {
+    if (res.destroyed) {
+      return;
+    }
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
+    writeJson(res, 502, {
+      error: "Unable to stream from Navidrome",
+      details: error.message
+    });
+  });
+
+  res.on("close", () => {
+    upstreamReq.destroy();
+  });
+
+  req.pipe(upstreamReq);
+}
+
+async function serveCachedAudio(req, res, requestUrl) {
+  const info = audioCacheInfoFromRequest(requestUrl);
+  if (!info) {
+    writeJson(res, 400, { error: "Missing track id" });
+    return;
+  }
+  const ready = await cachedAudioReady(info);
+  if (ready) {
+    serveCachedAudioFile(req, res, info, ready.size);
+    return;
+  }
+  const cachePromise = downloadAudioToCache(requestUrl, info);
+  if (req.headers.range && requestedRangeStart(req.headers.range) > 0) {
+    const warmed = await waitForCachedAudio(info);
+    if (warmed) {
+      serveCachedAudioFile(req, res, info, warmed.size);
+      return;
+    }
+  }
+  cachePromise.catch(() => {});
+  proxyAudioToNavidrome(req, res, requestUrl);
+}
+
+async function getAudioCacheStatus(requestUrl) {
+  const info = audioCacheInfoFromRequest(requestUrl);
+  if (!info) {
+    return null;
+  }
+  const ready = await cachedAudioReady(info);
+  return {
+    ok: true,
+    ready: Boolean(ready),
+    caching: audioCacheInflight.has(info.key),
+    size: ready?.size || 0
+  };
+}
+
+async function warmCachedAudio(requestUrl) {
+  const info = audioCacheInfoFromRequest(requestUrl);
+  if (!info) {
+    return null;
+  }
+  const ready = await cachedAudioReady(info);
+  if (ready) {
+    return { ok: true, ready: true, caching: false, size: ready.size };
+  }
+  downloadAudioToCache(requestUrl, info).catch(() => {});
+  return { ok: true, ready: false, caching: true, size: 0 };
 }
 
 function writeJson(res, statusCode, payload) {
@@ -423,6 +803,88 @@ createServer(async (req, res) => {
     } catch (error) {
       writeJson(res, 502, {
         error: "Unable to search community radio",
+        details: error.message
+      });
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/cache/navidrome/album") {
+    const albumId = String(requestUrl.searchParams.get("id") || "").trim();
+    if (!albumId) {
+      writeJson(res, 400, { error: "Missing album id" });
+      return;
+    }
+    try {
+      writeJson(res, 200, await getCachedNavidromeAlbum(requestUrl, albumId));
+    } catch (error) {
+      writeJson(res, 502, {
+        error: "Unable to load cached album details",
+        details: error.message
+      });
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/cache/navidrome/stream") {
+    serveCachedAudio(req, res, requestUrl).catch((error) => {
+      if (!res.headersSent) {
+        writeJson(res, 502, {
+          error: "Unable to serve cached audio",
+          details: error.message
+        });
+      } else {
+        res.destroy(error);
+      }
+    });
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/cache/navidrome/stream-status") {
+    try {
+      const status = await getAudioCacheStatus(requestUrl);
+      if (!status) {
+        writeJson(res, 400, { error: "Missing track id" });
+        return;
+      }
+      writeJson(res, 200, status);
+    } catch (error) {
+      writeJson(res, 502, {
+        error: "Unable to inspect audio cache",
+        details: error.message
+      });
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/cache/navidrome/warm-stream") {
+    try {
+      const status = await warmCachedAudio(requestUrl);
+      if (!status) {
+        writeJson(res, 400, { error: "Missing track id" });
+        return;
+      }
+      writeJson(res, 202, status);
+    } catch (error) {
+      writeJson(res, 502, {
+        error: "Unable to warm audio cache",
+        details: error.message
+      });
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/cache/navidrome/warm-albums") {
+    const albumIds = String(requestUrl.searchParams.get("ids") || "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+    try {
+      const queued = warmCachedNavidromeAlbums(requestUrl, albumIds);
+      writeJson(res, 202, { ok: true, queued });
+    } catch (error) {
+      writeJson(res, 502, {
+        error: "Unable to warm album cache",
         details: error.message
       });
     }
