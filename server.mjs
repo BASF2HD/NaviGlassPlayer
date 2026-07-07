@@ -30,6 +30,7 @@ const navidromeAlbumInflight = new Map();
 const navidromeAlbumCacheTtlMs = Number(process.env.ALBUM_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const navidromeAlbumCacheMaxItems = Number(process.env.ALBUM_CACHE_MAX_ITEMS || 5000);
 const navidromeAlbumWarmMaxItems = Number(process.env.ALBUM_CACHE_WARM_MAX_ITEMS || 32);
+const navidromeProxyTimeoutMs = Number(process.env.NAVIDROME_PROXY_TIMEOUT_MS || 12000);
 const audioCacheDir = process.env.AUDIO_CACHE_DIR || join(rootDir, ".cache", "audio");
 const audioCacheInflight = new Map();
 const audioCacheSeekWaitMs = Number(process.env.AUDIO_CACHE_SEEK_WAIT_MS || 12000);
@@ -767,6 +768,10 @@ function proxyToNavidrome(req, res, requestUrl) {
       });
     }
   );
+
+  proxyReq.setTimeout(navidromeProxyTimeoutMs, () => {
+    proxyReq.destroy(new Error("Navidrome request timed out"));
+  });
 
   proxyReq.on("error", (error) => {
     if (res.destroyed) {

@@ -495,7 +495,7 @@ function saveSettings() {
 }
 
 function normalizeServerUrl(value) {
-    let normalized = String(value || defaultSettings.serverUrl).trim();
+    let normalized = String(value || defaultSettings.serverUrl).trim().replace(/,+$/, "").trim();
     if (!normalized) {
         return defaultSettings.serverUrl;
     }
@@ -6350,6 +6350,7 @@ function setConnectPasswordVisible(visible) {
 }
 
 function showConnectError(message) {
+    hideStatus();
     setConnectModalOpen(true);
     elements.connectHelper.textContent = message;
 }
@@ -8331,6 +8332,7 @@ function setupInput() {
 
     let seekPointerActive = false;
     let activeSeekPointerId = null;
+    let lastSeekInteractionAt = 0;
 
     const beginSeekDrag = (event) => {
         const duration = getSeekDuration();
@@ -8342,12 +8344,14 @@ function setupInput() {
         }
         seekPointerActive = true;
         activeSeekPointerId = event.pointerId;
+        lastSeekInteractionAt = Date.now();
         elements.seekTrack.classList.add("is-seeking");
         if (typeof elements.seekTrack.setPointerCapture === "function") {
             elements.seekTrack.setPointerCapture(event.pointerId);
         }
         previewSeekFromClientX(event.clientX);
         event.preventDefault();
+        event.stopPropagation();
     };
 
     elements.seekTrack.addEventListener("pointerdown", beginSeekDrag);
@@ -8376,6 +8380,7 @@ function setupInput() {
             return;
         }
         seekPointerActive = false;
+        lastSeekInteractionAt = Date.now();
         elements.seekTrack.classList.remove("is-seeking");
         const seekValue = previewSeekFromClientX(event.clientX);
         if (activeSeekPointerId != null && typeof elements.seekTrack.releasePointerCapture === "function") {
@@ -8395,6 +8400,7 @@ function setupInput() {
         }
         seekPointerActive = false;
         activeSeekPointerId = null;
+        lastSeekInteractionAt = Date.now();
         elements.seekTrack.classList.remove("is-seeking");
         updatePlaybackStripUI();
     });
@@ -8722,7 +8728,9 @@ function setupInput() {
         const insideConnectModal = Boolean(event.target.closest?.("#connect-modal"));
         const insideInfoPanel = Boolean(event.target.closest?.("#info-panel"));
         const insideSearch = Boolean(event.target.closest?.("#search-panel, #btn-search"));
+        const insidePlaybackStrip = Boolean(event.target.closest?.("#playback-strip, #seek-track"));
         const clickedDrawerToggle = Boolean(event.target.closest?.("#btn-drawer"));
+        const recentSeekInteraction = Date.now() - lastSeekInteractionAt < 700;
         const insideBrowseMenu = Boolean(
             event.target.closest?.(".browse-menu-wrap") ||
                 event.target.closest?.(".browse-dropdown")
@@ -8738,6 +8746,8 @@ function setupInput() {
             !insideSongInfo &&
             !clickedDrawerToggle &&
             !clickedActiveCover &&
+            !insidePlaybackStrip &&
+            !recentSeekInteraction &&
             !insideVolumeWrap
         ) {
             setSongsDrawerOpen(false);
