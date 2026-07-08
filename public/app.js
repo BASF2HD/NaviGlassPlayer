@@ -3547,7 +3547,17 @@ function formatInfoPanelSubtitle(...parts) {
             seen.add(key);
             return true;
         });
-    return cleanParts.length ? cleanParts.join(" | ") : "\u00A0";
+    if (!cleanParts.length) {
+        return { text: "\u00A0", primary: "", year: "" };
+    }
+    const year = pickText(parts[parts.length - 1]);
+    const visibleYear = cleanParts.length > 1 && year ? cleanParts[cleanParts.length - 1] : "";
+    const primaryParts = visibleYear ? cleanParts.slice(0, -1) : cleanParts;
+    return {
+        text: cleanParts.join(" | "),
+        primary: primaryParts.join(" | "),
+        year: visibleYear,
+    };
 }
 
 function getInfoPanelLines() {
@@ -4692,9 +4702,42 @@ function updatePlaybackStripUI() {
 function updateBrowseSummary() {
     const infoLines = getInfoPanelLines();
     elements.trackTitle.textContent = infoLines.title;
-    elements.trackArtist.textContent = infoLines.subtitle;
+    renderInfoPanelSubtitle(infoLines.subtitle);
     renderInfoActionMenu();
     updateBrowseStripUI();
+}
+
+function renderInfoPanelSubtitle(subtitle) {
+    const target = elements.trackArtist;
+    target.textContent = "";
+    if (!subtitle || typeof subtitle !== "object") {
+        target.textContent = pickText(subtitle, "\u00A0");
+        return;
+    }
+    const primary = pickText(subtitle.primary);
+    const year = pickText(subtitle.year);
+    if (!primary && !year) {
+        target.textContent = pickText(subtitle.text, "\u00A0");
+        return;
+    }
+    if (primary) {
+        const primarySpan = document.createElement("span");
+        primarySpan.className = "info-subtitle-primary";
+        primarySpan.textContent = primary;
+        target.appendChild(primarySpan);
+    }
+    if (primary && year) {
+        const separatorSpan = document.createElement("span");
+        separatorSpan.className = "info-subtitle-separator";
+        separatorSpan.textContent = " | ";
+        target.appendChild(separatorSpan);
+    }
+    if (year) {
+        const yearSpan = document.createElement("span");
+        yearSpan.className = "info-subtitle-year";
+        yearSpan.textContent = year;
+        target.appendChild(yearSpan);
+    }
 }
 
 function updatePlaybackSummary() {
