@@ -1958,6 +1958,18 @@ body.is-player-fullscreen .player-fullscreen-button,
     pointer-events: none;
 }
 
+@media (max-width: 520px) {
+    .browse-btn.is-active::after {
+        left: 0;
+        right: 0;
+        bottom: 0;
+    }
+
+    .browse-btn svg {
+        filter: none;
+    }
+}
+
 .browse-btn:active {
     background: rgba(255, 255, 255, 0.08);
 }
