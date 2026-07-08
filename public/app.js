@@ -4337,12 +4337,28 @@ function renderBrowseMenus() {
         );
     });
 
-    renderAlbumDropdown();
-    renderArtistDropdown();
-    renderSongsDropdown();
-    renderPlaylistDropdown();
-    renderMoreDropdown();
-    renderSettingsDropdown();
+    switch (state.activeDropdown) {
+        case "album":
+            renderAlbumDropdown();
+            break;
+        case "artist":
+            renderArtistDropdown();
+            break;
+        case "songs":
+            renderSongsDropdown();
+            break;
+        case "playlist":
+            renderPlaylistDropdown();
+            break;
+        case "more":
+            renderMoreDropdown();
+            break;
+        case "settings":
+            renderSettingsDropdown();
+            break;
+        default:
+            break;
+    }
 
     elements.albumDropdown.classList.toggle("is-open", state.activeDropdown === "album");
     elements.albumDropdown.setAttribute("aria-hidden", String(state.activeDropdown !== "album"));
@@ -7983,25 +7999,30 @@ function setupInput() {
     });
     elements.browseArtist.addEventListener("click", async (event) => {
         event.stopPropagation();
-        const nextDropdown = state.activeDropdown === "artist" ? null : "artist";
+        const switchingToArtistMode = !isArtistBrowseMode(state.browseMode);
+        const nextDropdown = switchingToArtistMode && shouldUsePhoneSeekCache()
+            ? null
+            : state.activeDropdown === "artist" ? null : "artist";
         state.activeDropdown = nextDropdown;
         renderBrowseMenus();
-        if (state.connected) {
-            if (!state.artistOptions.length) {
-                await ensureArtistOptions();
-            }
-            if (state.settings.artistPanel === "albumArtist" && !state.albumArtistOptions.length) {
-                await ensureAlbumArtistOptions();
-            }
-            if (state.settings.artistPanel === "composer" && !state.composerOptions.length) {
-                await ensureComposerOptions();
-            }
-        }
-        if (!isArtistBrowseMode(state.browseMode)) {
+        if (switchingToArtistMode) {
             await setBrowseMode(browseModeForArtistPanel(), { activeDropdown: nextDropdown });
-            return;
         }
-        renderBrowseMenus();
+        if (state.connected) {
+            Promise.allSettled([
+                state.artistOptions.length ? Promise.resolve() : ensureArtistOptions(),
+                state.settings.artistPanel === "albumArtist" && !state.albumArtistOptions.length
+                    ? ensureAlbumArtistOptions()
+                    : Promise.resolve(),
+                state.settings.artistPanel === "composer" && !state.composerOptions.length
+                    ? ensureComposerOptions()
+                    : Promise.resolve(),
+            ]).then(() => {
+                if (state.activeDropdown === "artist") {
+                    renderBrowseMenus();
+                }
+            });
+        }
     });
     elements.browsePlaylist.addEventListener("click", async (event) => {
         event.stopPropagation();
