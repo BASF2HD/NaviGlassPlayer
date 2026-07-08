@@ -2661,24 +2661,36 @@ body.is-player-fullscreen .player-fullscreen-button,
     }
 
     #controls {
+        --controls-shell-width: 100vw !important;
+        --controls-padding-side: 0px !important;
+        --transport-gap: 2px !important;
         --ctrl-btn-size: 52px !important;
         --ctrl-btn-icon-size: 26px !important;
-        --ctrl-play-size: 60px !important;
-        --ctrl-play-icon-size: 28px !important;
+        --ctrl-play-size: 52px !important;
+        --ctrl-play-icon-size: 26px !important;
         --browse-btn-min-height: 52px !important;
         --browse-btn-icon-size: 22px !important;
         --browse-btn-font-size: 9.5px !important;
         --browse-btn-padding-y: 8px !important;
+        --browse-strip-shell-height: 32px !important;
+        --browse-strip-track-height: 18px !important;
+        --browse-strip-thumb-height: 18px !important;
         --browse-bar-gap: 4px !important;
         --transport-cluster-height: 64px !important;
-        --transport-cluster-gap: 8px !important;
+        --transport-cluster-gap: 2px !important;
         --controls-padding-top: 8px !important;
         --controls-padding-bottom: max(10px, env(safe-area-inset-bottom)) !important;
         bottom: 4px;
     }
 
+    .transport-cluster-primary .ctrl-btn:not(.ctrl-play),
+    #btn-drawer {
+        width: 44px;
+    }
+
     #playback-strip {
         position: absolute;
+        z-index: 122;
         grid-template-columns: minmax(0, max-content) minmax(32px, 1fr) auto auto;
         padding: 0 2px;
         max-width: calc(100% - 16px);
