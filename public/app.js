@@ -3360,18 +3360,21 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
             nextIndex = 0;
         }
 
-        state.browseIndex = browseEntries.length ? nextIndex : 0;
-        state.activeEntryKey = browseEntries[state.browseIndex]?.key || null;
+        const targetIndex = browseEntries.length ? nextIndex : 0;
+        state.browseIndex = targetIndex;
+        state.activeEntryKey = browseEntries[targetIndex]?.key || null;
         setAlbumData(browseEntries.map((_, index) => textures[index] || getDefaultTexture()));
-        ensureTextures();
+        state.browseIndex = targetIndex;
+        state.activeEntryKey = browseEntries[targetIndex]?.key || null;
+        ensureTextures(targetIndex);
 
         if (browseEntries.length === 0) {
             jumpTo(0);
             state.drawerContext = { key: "", title: "Songs", subtitle: "", items: [], loading: false, albumId: "", albumStarred: false };
         } else if (animate) {
-            navigateTo(state.browseIndex);
+            navigateTo(targetIndex);
         } else {
-            jumpTo(state.browseIndex);
+            jumpTo(targetIndex);
         }
 
         hideStatus();
@@ -3433,18 +3436,21 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
             nextIndex = 0;
         }
 
-        state.browseIndex = browseEntries.length ? nextIndex : 0;
-        state.activeEntryKey = browseEntries[state.browseIndex]?.key || null;
+        const targetIndex = browseEntries.length ? nextIndex : 0;
+        state.browseIndex = targetIndex;
+        state.activeEntryKey = browseEntries[targetIndex]?.key || null;
         setAlbumData(browseEntries.map((_, index) => textures[index] || getDefaultTexture()));
-        ensureTextures();
+        state.browseIndex = targetIndex;
+        state.activeEntryKey = browseEntries[targetIndex]?.key || null;
+        ensureTextures(targetIndex);
 
         if (browseEntries.length === 0) {
             jumpTo(0);
             state.drawerContext = { key: "", title: "Songs", subtitle: "", items: [], loading: false, albumId: "", albumStarred: false };
         } else if (animate) {
-            navigateTo(state.browseIndex);
+            navigateTo(targetIndex);
         } else {
-            jumpTo(state.browseIndex);
+            jumpTo(targetIndex);
         }
 
         hideStatus();
@@ -6439,6 +6445,61 @@ function selectedPlaylistOption() {
     return state.playlistOptions.find((playlist) => playlist.id === state.settings.selectedPlaylistId) || null;
 }
 
+function trackIdentityMatches(left, right) {
+    if (!left || !right) {
+        return false;
+    }
+    const leftId = pickText(left.id);
+    const rightId = pickText(right.id);
+    if (leftId && rightId && leftId === rightId) {
+        return true;
+    }
+    const leftStream = pickText(left.streamUrl, left.previewUrl);
+    const rightStream = pickText(right.streamUrl, right.previewUrl);
+    return Boolean(leftStream && rightStream && leftStream === rightStream);
+}
+
+function albumIdentityMatches(entry, track) {
+    if (!entry || !track) {
+        return false;
+    }
+    const trackAlbumId = pickText(track.albumId, track.drawerAlbumId);
+    if (trackAlbumId) {
+        if (pickText(entry.id) === trackAlbumId) {
+            return true;
+        }
+        if (Array.isArray(entry.groupAlbumIds) && entry.groupAlbumIds.map(String).includes(trackAlbumId)) {
+            return true;
+        }
+    }
+
+    const entryAlbumTitle = normalizeAlbumGroupTitle(entry.title || entry.album);
+    const trackAlbumTitle = normalizeAlbumGroupTitle(track.album);
+    if (entryAlbumTitle && trackAlbumTitle && entryAlbumTitle === trackAlbumTitle) {
+        return true;
+    }
+
+    const entryCoverArt = pickText(entry.coverArt);
+    const trackCoverArt = pickText(track.coverArt);
+    return Boolean(entryCoverArt && trackCoverArt && entryCoverArt === trackCoverArt);
+}
+
+function entryContainsPlaybackTrack(entry, track) {
+    if (!entry || !track) {
+        return false;
+    }
+    if (Array.isArray(entry.groupTracks) && entry.groupTracks.some((groupTrack) => trackIdentityMatches(groupTrack, track))) {
+        return true;
+    }
+    if (entry.kind === "song") {
+        return trackIdentityMatches(entry, track);
+    }
+    if (entry.kind === "album") {
+        return albumIdentityMatches(entry, track);
+    }
+    return false;
+}
+
 function keyForTrackInCurrentMode(track) {
     if (!track) {
         return null;
@@ -6446,28 +6507,20 @@ function keyForTrackInCurrentMode(track) {
 
     switch (state.browseMode) {
         case BROWSE_MODE.SONGS:
-            return browseEntries.find((entry) =>
-                entry.id === track.id ||
-                entry.id === track.albumId ||
-                entry.groupTracks?.some((groupTrack) => groupTrack.id === track.id)
-            )?.key || null;
+            return browseEntries.find((entry) => entryContainsPlaybackTrack(entry, track))?.key || null;
         case BROWSE_MODE.ARTIST: {
             const selectedArtist = selectedArtistOption();
             if (!selectedArtist || selectedArtist.value !== track.artist) {
                 return null;
             }
-            return browseEntries.find((entry) => entry.id === track.id)?.key || null;
+            return browseEntries.find((entry) => entryContainsPlaybackTrack(entry, track))?.key || null;
         }
         case BROWSE_MODE.ALBUM_ARTIST:
             if (!state.settings.selectedAlbumArtist ||
                 String(track.albumArtist || track.artist || "").toLocaleLowerCase() !== state.settings.selectedAlbumArtist.toLocaleLowerCase()) {
                 return null;
             }
-            return browseEntries.find((entry) =>
-                entry.id === track.id ||
-                entry.id === track.albumId ||
-                entry.groupTracks?.some((groupTrack) => groupTrack.id === track.id)
-            )?.key || null;
+            return browseEntries.find((entry) => entryContainsPlaybackTrack(entry, track))?.key || null;
         case BROWSE_MODE.COMPOSER:
             if (!state.settings.selectedComposer || !String(track.composer || "")
                 .split(/[;,]/)
@@ -6475,34 +6528,20 @@ function keyForTrackInCurrentMode(track) {
                 .includes(state.settings.selectedComposer.toLocaleLowerCase())) {
                 return null;
             }
-            return browseEntries.find((entry) =>
-                entry.id === track.id ||
-                entry.id === track.albumId ||
-                entry.groupTracks?.some((groupTrack) => groupTrack.id === track.id)
-            )?.key || null;
+            return browseEntries.find((entry) => entryContainsPlaybackTrack(entry, track))?.key || null;
         case BROWSE_MODE.PLAYLIST:
-            return browseEntries.find((entry) =>
-                entry.id === track.id ||
-                entry.id === track.albumId ||
-                entry.groupTracks?.some((groupTrack) => groupTrack.id === track.id)
-            )?.key || null;
+            return browseEntries.find((entry) => entryContainsPlaybackTrack(entry, track))?.key || null;
         case BROWSE_MODE.SEARCH:
-            return browseEntries.find((entry) =>
-                entry.kind === "song" && entry.id === track.id ||
-                entry.kind === "album" && entry.id === track.albumId
-            )?.key || null;
+            return browseEntries.find((entry) => entryContainsPlaybackTrack(entry, track))?.key || null;
         case BROWSE_MODE.STARRED:
         case BROWSE_MODE.RADIO:
-            return browseEntries.find((entry) => entry.id === track.id)?.key || null;
+            return browseEntries.find((entry) => entryContainsPlaybackTrack(entry, track))?.key || null;
         case BROWSE_MODE.YEAR:
         case BROWSE_MODE.GENRE:
         case BROWSE_MODE.RATING:
         case BROWSE_MODE.ALBUM:
         default:
-            return browseEntries.find((entry) =>
-                entry.kind === "album" &&
-                (entry.id === track.albumId || entry.groupAlbumIds?.includes(track.albumId))
-            )?.key || null;
+            return browseEntries.find((entry) => entry.kind === "album" && albumIdentityMatches(entry, track))?.key || null;
     }
 }
 
