@@ -16,7 +16,7 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="apple-touch-icon" href="/naviglassplayer-logo.svg">
 
-    <link rel="stylesheet" href="/styles.css?v=20260708-info-year-visible">
+    <link rel="stylesheet" href="/styles.css?v=20260917-music-list-export">
 </head>
 <body>
     <div id="app">
@@ -353,6 +353,67 @@
         </div>
     </div>
 
+    <div id="export-modal" class="connect-modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="export-title">
+        <div class="connect-card export-card">
+            <div class="connect-header">
+                <div class="connect-title-wrap">
+                    <div id="export-title" class="connect-title">Export music lists</div>
+                    <div class="connect-subtitle">Create one CSV for filtering and curating your saved music.</div>
+                </div>
+                <button id="btn-export-close" class="drawer-close-btn" type="button" aria-label="Close export dialog">
+                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                        <path fill="currentColor"
+                              d="M18.3 5.71 12 12l6.3 6.29-1.41 1.41L10.59 13.4 4.29 19.7 2.88 18.29 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.29-6.3z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="connect-content export-content">
+                <div class="export-section-label">Include</div>
+                <div class="export-source-list">
+                    <label class="export-option">
+                        <input id="export-favourite-songs" type="checkbox" checked>
+                        <span>
+                            <strong>Favourite songs</strong>
+                            <small>Songs marked as favourites</small>
+                        </span>
+                    </label>
+                    <label class="export-option">
+                        <input id="export-favourite-albums" type="checkbox" checked>
+                        <span>
+                            <strong>Favourite albums</strong>
+                            <small>Every song inside favourite albums</small>
+                        </span>
+                    </label>
+                    <label class="export-option">
+                        <input id="export-playlists" type="checkbox" checked>
+                        <span>
+                            <strong>Playlists</strong>
+                            <small>Choose all or individual playlists</small>
+                        </span>
+                    </label>
+                </div>
+
+                <div id="export-playlists-panel" class="export-playlists-panel">
+                    <div class="export-playlists-header">
+                        <span id="export-playlists-summary">Loading playlists...</span>
+                        <span class="export-playlists-actions">
+                            <button id="btn-export-select-all" type="button">All</button>
+                            <button id="btn-export-select-none" type="button">None</button>
+                        </span>
+                    </div>
+                    <div id="export-playlist-list" class="export-playlist-list" aria-label="Playlists"></div>
+                </div>
+
+                <div id="export-status" class="connect-helper export-status" aria-live="polite">The CSV includes blank Keep and Notes columns for curation.</div>
+                <div id="export-progress" class="export-progress hidden" aria-hidden="true"><span></span></div>
+                <div class="connect-actions">
+                    <button id="btn-export-cancel" class="connect-btn connect-btn-secondary" type="button">Cancel</button>
+                    <button id="btn-export-download" class="connect-btn connect-btn-primary" type="button">Export CSV</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <audio id="audio-player" preload="metadata"></audio>
 
     <!--
@@ -364,6 +425,6 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.11.5/gsap.min.js"></script>
 
     <!-- App modules -->
-    <script type="module" src="/app.js?v=20260714-stable-playing-menu-center"></script>
+    <script type="module" src="/app.js?v=20260917-music-list-export"></script>
 </body>
 </html>
