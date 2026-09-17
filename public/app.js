@@ -6689,6 +6689,17 @@ function csvCell(value) {
     return `"${spreadsheetSafeValue(value).replaceAll('"', '""')}"`;
 }
 
+function exportFileDetails(track) {
+    const relativePath = String(track.file || "").trim();
+    const fileName = relativePath.split(/[\\/]/).pop() || "";
+    const extensionIndex = fileName.lastIndexOf(".");
+    const fileExtension =
+        extensionIndex > 0 && extensionIndex < fileName.length - 1
+            ? fileName.slice(extensionIndex + 1)
+            : String(track.suffix || "").trim();
+    return { relativePath, fileName, fileExtension };
+}
+
 function buildMusicListCsv(records) {
     const headers = [
         "keep",
@@ -6704,8 +6715,11 @@ function buildMusicListCsv(records) {
         "duration",
         "format",
         "bitrate_kbps",
+        "file_name",
+        "file_extension",
         "relative_path",
         "favourite_song",
+        "favourite_album",
         "favourite_albums",
         "playlists",
         "playlist_positions",
@@ -6727,6 +6741,7 @@ function buildMusicListCsv(records) {
     });
     const rows = sorted.map((record) => {
         const track = record.track;
+        const file = exportFileDetails(track);
         const playlistNames = [...record.playlists.keys()];
         const playlistPositions = [...record.playlists.entries()].map(([name, positions]) => {
             const values = [...positions].filter(Boolean).sort((left, right) => left - right);
@@ -6746,8 +6761,11 @@ function buildMusicListCsv(records) {
             track.duration ? formatClock(track.duration) : "",
             String(track.suffix || "").toUpperCase(),
             track.bitRate || "",
-            track.file,
+            file.fileName,
+            file.fileExtension,
+            file.relativePath,
             record.favouriteSong ? "Yes" : "",
+            record.favouriteAlbums.size ? "Yes" : "",
             [...record.favouriteAlbums].join(" | "),
             playlistNames.join(" | "),
             playlistPositions.join(" | "),
