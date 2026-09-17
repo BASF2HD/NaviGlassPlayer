@@ -1,8 +1,8 @@
 # NaviGlassPlayer
 
-![NaviGlassPlayer glass-style music player banner](docs/assets/naviglassplayer-github-banner.png)
+![NaviGlassPlayer Cover Flow interface](docs/assets/naviglassplayer-app-preview.png)
 
-This repo contains a standalone NaviGlassPlayer web client plus fresh-install deployment scripts for Rocky Linux, Ubuntu, Synology DSM, and Raspberry Pi OS.
+NaviGlassPlayer is a standalone, browser-based Navidrome player built around a reflective Cover Flow library. This repository also includes fresh-install deployment scripts for Rocky Linux, Ubuntu, Synology DSM, and Raspberry Pi OS.
 
 ## App
 
@@ -25,6 +25,30 @@ Project site (GitHub Pages):
 ```text
 https://basf2hd.github.io/NaviGlassPlayer/
 ```
+
+## Features
+
+- Reflective WebGL Cover Flow for albums, songs, artists, playlists, years, genres, favourites, and radio
+- Responsive desktop, phone, tablet, and Raspberry Pi layouts
+- Browser IndexedDB caching plus server-side album and stream caches
+- Album song drawer, track information, ratings, favourites, search, seeking, and playback controls
+- Navidrome playlists and internet radio browsing
+- CSV export for favourite songs, favourite albums, and selected playlists
+- Local Node proxy so Navidrome credentials and media stay on the configured server path
+
+## Export Music Lists
+
+Open **Settings → Export music lists** to create a UTF-8 CSV for filtering and curating saved music.
+
+The export can include:
+
+- songs marked as favourites
+- every song inside albums marked as favourites
+- all playlists or individually selected playlists
+
+Songs appearing in more than one source are deduplicated by Navidrome song ID while preserving every album and playlist membership. The CSV includes blank `keep` and `notes` columns plus title, artist, album, year, genre, composer, track number, duration, format, bitrate, exact `file_name`, `file_extension`, `relative_path`, favourite-song and favourite-album flags, playlist names and positions, selection sources, and the Navidrome song ID.
+
+`file_name` contains the exact basename and extension reported by Navidrome, making the exported list suitable for matching files in Finder, Windows Explorer, or another library-management tool.
 
 ## Recommended Private Access
 
