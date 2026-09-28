@@ -16,6 +16,12 @@ import {
     worldToScreenX,
     worldToScreenY,
 } from "./renderer.js";
+import {
+    albumReleaseYearsMatch,
+    albumTitleYearIdentity,
+    normalizeAlbumGroupTitle,
+} from "./album-identity.js?v=1";
+import { resolveVerticalMenuPlacement } from "./context-menu-position.js?v=1";
 
 const STORAGE_KEY = "naviglassplayer-settings";
 const LEGACY_SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
@@ -38,7 +44,7 @@ const CACHE_DB_NAME = "naviglassplayer-cache";
 const CACHE_DB_VERSION = 1;
 const BROWSE_CACHE_STORE = "browseViews";
 const ARTWORK_CACHE_STORE = "artwork";
-const BROWSE_CACHE_SCHEMA_VERSION = 3;
+const BROWSE_CACHE_SCHEMA_VERSION = 4;
 const PERSISTENT_BROWSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PERSISTENT_ARTWORK_ITEMS = 3500;
 const STREAM_CACHE_SEEK_WAIT_MS = 45000;
@@ -145,6 +151,7 @@ const elements = {
     songsDrawerTitle: document.getElementById("songs-drawer-title"),
     songsDrawerSubtitle: document.getElementById("songs-drawer-subtitle"),
     drawerFavouriteIconPath: document.getElementById("drawer-favourite-icon-path"),
+    songsTableWrap: document.querySelector("#songs-drawer .songs-table-wrap"),
     songsTableBody: document.getElementById("songs-table-body"),
     songInfoModal: document.getElementById("song-info-modal"),
     songInfoCard: document.querySelector("#song-info-modal .song-info-card"),
@@ -258,12 +265,16 @@ let streamCacheHandoffTimerId = 0;
 let streamCacheHandoffInProgress = false;
 let playbackIntentPlaying = false;
 let playlistMembershipCache = new Map();
+let playlistMembershipLoadPromises = new Map();
+let playlistDetailsLoadPromises = new Map();
+let pendingFavouriteMutations = new Set();
 let radioCoverLookupPromises = new Map();
 let browseEntryCache = new Map();
 let activeBrowseEntryCacheKey = "";
 let coverTextureCache = new Map();
 let albumDetailsLoadPromises = new Map();
 let drawerDetailPrefetchTimerId = 0;
+let songMenuPositionFrameId = 0;
 let cacheDbPromise = null;
 let activeLibraryCacheScope = "";
 let persistentArtworkWriteCount = 0;
@@ -359,6 +370,7 @@ function scheduleResizeLayout() {
     resizeLayoutTimer = window.setTimeout(() => {
         resizeLayoutTimer = 0;
         positionInfoPanel();
+        scheduleActiveSongMenuPosition();
     }, 120);
 }
 
@@ -1593,15 +1605,6 @@ function normalizeIdentityText(value) {
     return pickText(value).trim().toLocaleLowerCase();
 }
 
-function normalizeAlbumGroupTitle(value) {
-    return pickText(value)
-        .normalize("NFKC")
-        .replace(/[\u200B-\u200D\uFEFF]/g, "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLocaleLowerCase();
-}
-
 function isUnknownAlbumTitle(value) {
     const title = normalizeAlbumGroupTitle(value);
     return !title || [
@@ -1676,29 +1679,58 @@ async function loadTrackPlaylistMemberships(track, { force = false } = {}) {
     if (!key) {
         return new Map();
     }
+    if (force) {
+        playlistMembershipCache.delete(key);
+    }
     if (!force && playlistMembershipCache.has(key)) {
         return playlistMembershipCache.get(key);
     }
+    if (playlistMembershipLoadPromises.has(key)) {
+        return playlistMembershipLoadPromises.get(key);
+    }
 
-    const playlists = await ensurePlaylistOptions();
-    const memberships = new Map();
-    for (const playlistOption of playlists) {
-        const playlistId = String(playlistOption.id || "");
-        if (!playlistId) {
-            continue;
-        }
-        const playlist = await ensurePlaylistDetails(playlistId);
-        const index = playlist.tracks.findIndex((playlistTrack) => tracksReferToSameSong(playlistTrack, track));
-        if (index >= 0) {
-            memberships.set(playlistId, {
-                playlistId,
-                index,
-                title: playlist.title || playlistOption.title || "playlist",
-            });
+    const loadPromise = (async () => {
+        const playlists = await ensurePlaylistOptions();
+        const memberships = new Map();
+        await mapWithConcurrency(playlists, 6, async (playlistOption) => {
+            const playlistId = String(playlistOption.id || "");
+            if (!playlistId) {
+                return;
+            }
+            const playlist = await ensurePlaylistDetails(playlistId);
+            const index = playlist.tracks.findIndex((playlistTrack) => tracksReferToSameSong(playlistTrack, track));
+            if (index >= 0) {
+                memberships.set(playlistId, {
+                    playlistId,
+                    index,
+                    title: playlist.title || playlistOption.title || "playlist",
+                });
+            }
+        });
+        playlistMembershipCache.set(key, memberships);
+        return memberships;
+    })();
+
+    playlistMembershipLoadPromises.set(key, loadPromise);
+    try {
+        return await loadPromise;
+    } finally {
+        if (playlistMembershipLoadPromises.get(key) === loadPromise) {
+            playlistMembershipLoadPromises.delete(key);
         }
     }
-    playlistMembershipCache.set(key, memberships);
-    return memberships;
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+    const queue = [...items];
+    const workerCount = Math.min(Math.max(1, concurrency), queue.length);
+    await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+            while (queue.length) {
+                await worker(queue.shift());
+            }
+        })
+    );
 }
 
 async function buildAlbumGroupEntries(tracks, { source, contextId = source } = {}) {
@@ -1755,10 +1787,10 @@ async function buildAlbumGroupEntries(tracks, { source, contextId = source } = {
     return entries;
 }
 
-function albumShelfGroupKey({ title = "", fallback = "" } = {}) {
+function albumShelfGroupKey({ title = "", year = "", fallback = "" } = {}) {
     const albumTitle = normalizeAlbumGroupTitle(title);
     if (albumTitle && albumTitle !== "unknown album") {
-        return `album-shelf:${albumTitle}`;
+        return `album-shelf:${albumTitleYearIdentity(title, year)}`;
     }
     return `fallback:${pickText(fallback)}`;
 }
@@ -1766,7 +1798,7 @@ function albumShelfGroupKey({ title = "", fallback = "" } = {}) {
 function songAlbumGroupKey(track) {
     const albumTitle = normalizeAlbumGroupTitle(track?.album);
     if (albumTitle && albumTitle !== "unknown album") {
-        return `song-album-title:${albumTitle}`;
+        return `song-album-title:${albumTitleYearIdentity(track.album, track.year)}`;
     }
     const albumId = pickText(track?.albumId);
     if (albumId) {
@@ -1791,6 +1823,7 @@ function groupAlbumEntriesByTitle(entries) {
 
         const groupKey = albumShelfGroupKey({
             title: entry.title,
+            year: entry.year,
             fallback: pickText(entry.coverArt, entry.key),
         });
         if (!groups.has(groupKey)) {
@@ -2864,6 +2897,8 @@ function invalidateLibraryCaches({ persistent = true } = {}) {
     textureLoadPromises.clear();
     radioCoverLookupPromises.clear();
     playlistMembershipCache.clear();
+    playlistMembershipLoadPromises.clear();
+    playlistDetailsLoadPromises.clear();
     streamCacheReadyKeys.clear();
     streamCacheHandoffDoneKeys.clear();
     clearStreamCacheHandoffTimer();
@@ -2967,31 +3002,46 @@ async function ensurePlaylistDetails(playlistId) {
     if (state.detailsCache.has(key)) {
         return state.detailsCache.get(key);
     }
-    const playlistLabel =
-        state.playlistOptions.find((playlist) => playlist.id === playlistId)?.title || "Playlist";
-    const payload = await fetchJson("/rest/getPlaylist.view", { id: playlistId });
-    const playlist = {
-        id: String(payload.playlist?.id || playlistId),
-        title: pickText(payload.playlist?.name, playlistLabel),
-        tracks: ensureArray(payload.playlist?.entry).map((track, index) =>
-            normalizeTrack(track, {
-                source: BROWSE_MODE.PLAYLIST,
-                contextId: String(playlistId),
-                playlistId: String(playlistId),
-                playlistName: pickText(payload.playlist?.name, playlistLabel),
-                key: `song:playlist:${playlistId}:${track.id || index}`,
-                index,
-            })
-        ),
-    };
-    const playlistOption = state.playlistOptions.find((option) => option.id === playlist.id);
-    if (playlistOption) {
-        playlistOption.title = playlist.title;
-        playlistOption.songCount = playlist.tracks.length;
-        playlistOption.subtitle = formatSongCount(playlist.tracks.length);
+    if (playlistDetailsLoadPromises.has(key)) {
+        return playlistDetailsLoadPromises.get(key);
     }
-    state.detailsCache.set(key, playlist);
-    return playlist;
+
+    const loadPromise = (async () => {
+        const playlistLabel =
+            state.playlistOptions.find((playlist) => playlist.id === playlistId)?.title || "Playlist";
+        const payload = await fetchJson("/rest/getPlaylist.view", { id: playlistId });
+        const playlist = {
+            id: String(payload.playlist?.id || playlistId),
+            title: pickText(payload.playlist?.name, playlistLabel),
+            tracks: ensureArray(payload.playlist?.entry).map((track, index) =>
+                normalizeTrack(track, {
+                    source: BROWSE_MODE.PLAYLIST,
+                    contextId: String(playlistId),
+                    playlistId: String(playlistId),
+                    playlistName: pickText(payload.playlist?.name, playlistLabel),
+                    key: `song:playlist:${playlistId}:${track.id || index}`,
+                    index,
+                })
+            ),
+        };
+        const playlistOption = state.playlistOptions.find((option) => option.id === playlist.id);
+        if (playlistOption) {
+            playlistOption.title = playlist.title;
+            playlistOption.songCount = playlist.tracks.length;
+            playlistOption.subtitle = formatSongCount(playlist.tracks.length);
+        }
+        state.detailsCache.set(key, playlist);
+        return playlist;
+    })();
+
+    playlistDetailsLoadPromises.set(key, loadPromise);
+    try {
+        return await loadPromise;
+    } finally {
+        if (playlistDetailsLoadPromises.get(key) === loadPromise) {
+            playlistDetailsLoadPromises.delete(key);
+        }
+    }
 }
 
 async function ensureArtistTopSongs(artistName) {
@@ -5942,8 +5992,10 @@ function renderSongsDrawer() {
     elements.songsDrawerSubtitle.textContent = context.subtitle || "\u00A0";
     elements.songsDrawerCount.textContent = context.loading ? "..." : formatCount(items.length, "song");
     const hasAlbumContext = Boolean(context.albumId);
+    const albumFavouritePending = hasAlbumContext && pendingFavouriteMutations.has(`album:${context.albumId}`);
     elements.btnDrawerFavourite.classList.toggle("hidden", !hasAlbumContext);
     elements.btnDrawerFavourite.classList.toggle("is-active", hasAlbumContext && Boolean(context.albumStarred));
+    elements.btnDrawerFavourite.disabled = albumFavouritePending;
     elements.btnDrawerFavourite.setAttribute(
         "aria-label",
         hasAlbumContext && context.albumStarred ? "Remove album favourite" : "Favourite album"
@@ -6023,7 +6075,7 @@ function renderSongsDrawer() {
             `;
 
             return `
-                <tr class="${[isCurrent ? "is-current" : "", menuOpen ? "is-menu-open" : ""].filter(Boolean).join(" ")}" ${isCurrent ? 'aria-current="true"' : ""}>
+                <tr class="${[isCurrent ? "is-current" : "", menuOpen ? "is-menu-open" : ""].filter(Boolean).join(" ")}" data-song-index="${rowIndex}" ${isCurrent ? 'aria-current="true"' : ""}>
                     <td class="song-row-nr">${rowNumberHtml}</td>
                     <td class="song-row-title-cell">
                         <button class="song-row-title-wrap" data-action="play-song" data-index="${rowIndex}">
@@ -6048,6 +6100,55 @@ function renderSongsDrawer() {
             `;
         })
         .join("");
+
+    scheduleActiveSongMenuPosition();
+}
+
+function scheduleActiveSongMenuPosition() {
+    if (songMenuPositionFrameId) {
+        window.cancelAnimationFrame(songMenuPositionFrameId);
+    }
+    songMenuPositionFrameId = window.requestAnimationFrame(() => {
+        songMenuPositionFrameId = 0;
+        positionActiveSongMenu();
+    });
+}
+
+function positionActiveSongMenu() {
+    const menu = elements.songsTableBody.querySelector(
+        ".song-row-actions.is-menu-open > .song-context-menu"
+    );
+    if (!menu) {
+        return;
+    }
+
+    const anchor = menu.closest(".song-row-actions");
+    const scrollHost = menu.closest(".songs-table-wrap");
+    if (!anchor || !scrollHost) {
+        return;
+    }
+
+    menu.classList.remove("opens-up");
+    menu.style.removeProperty("max-height");
+
+    const hostRect = scrollHost.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const configuredMaxHeight = Number.parseFloat(window.getComputedStyle(menu).maxHeight);
+    const desiredHeight = Math.min(
+        menu.scrollHeight,
+        Number.isFinite(configuredMaxHeight) ? configuredMaxHeight : menu.scrollHeight
+    );
+    const placement = resolveVerticalMenuPlacement({
+        hostTop: hostRect.top,
+        hostBottom: hostRect.bottom,
+        anchorTop: anchorRect.top,
+        anchorBottom: anchorRect.bottom,
+        menuHeight: Math.max(menuRect.height, desiredHeight),
+    });
+
+    menu.classList.toggle("opens-up", placement.opensUp);
+    menu.style.maxHeight = `${Math.max(40, Math.floor(placement.availableHeight))}px`;
 }
 
 function buildSongInfoRows(track, index) {
@@ -6300,6 +6401,23 @@ function normalizedWheelStep(event) {
 
 function isCoverCanvasTarget(target) {
     return target?.tagName === "CANVAS";
+}
+
+function hasTextSelectionWithin(element) {
+    const selection = window.getSelection?.();
+    if (!element || !selection || selection.isCollapsed || !selection.toString().trim()) {
+        return false;
+    }
+    const anchorElement = selection.anchorNode?.nodeType === Node.ELEMENT_NODE
+        ? selection.anchorNode
+        : selection.anchorNode?.parentElement;
+    const focusElement = selection.focusNode?.nodeType === Node.ELEMENT_NODE
+        ? selection.focusNode
+        : selection.focusNode?.parentElement;
+    return Boolean(
+        (anchorElement && element.contains(anchorElement)) ||
+        (focusElement && element.contains(focusElement))
+    );
 }
 
 function isInteractiveTouchTarget(target) {
@@ -6991,7 +7109,12 @@ function albumIdentityMatches(entry, track) {
 
     const entryAlbumTitle = normalizeAlbumGroupTitle(entry.title || entry.album);
     const trackAlbumTitle = normalizeAlbumGroupTitle(track.album);
-    if (entryAlbumTitle && trackAlbumTitle && entryAlbumTitle === trackAlbumTitle) {
+    if (
+        entryAlbumTitle &&
+        trackAlbumTitle &&
+        entryAlbumTitle === trackAlbumTitle &&
+        albumReleaseYearsMatch(entry.year, track.year)
+    ) {
         return true;
     }
 
@@ -7625,15 +7748,31 @@ async function toggleTrackFavourite(track) {
     if (!track?.id) {
         return;
     }
+    const mutationKey = `track:${track.id}`;
+    if (pendingFavouriteMutations.has(mutationKey)) {
+        return;
+    }
     const nextStarred = !track.starred;
-    await fetchJson(nextStarred ? "/rest/star.view" : "/rest/unstar.view", { id: track.id });
-    invalidateBrowseEntryCache();
+    pendingFavouriteMutations.add(mutationKey);
     updateTrackEverywhere(track.id, (item) => {
         item.starred = nextStarred;
     });
     renderSongsDrawer();
-    updateUI();
-    flashStatus(nextStarred ? `Starred ${track.title}` : `Removed star from ${track.title}`);
+    updateBrowseSummary();
+    try {
+        await fetchJson(nextStarred ? "/rest/star.view" : "/rest/unstar.view", { id: track.id });
+        invalidateBrowseEntryCache();
+        flashStatus(nextStarred ? `Starred ${track.title}` : `Removed star from ${track.title}`);
+    } catch (error) {
+        updateTrackEverywhere(track.id, (item) => {
+            item.starred = !nextStarred;
+        });
+        renderSongsDrawer();
+        updateBrowseSummary();
+        flashStatus(`Could not update favourite: ${error?.message || error}`, 2600);
+    } finally {
+        pendingFavouriteMutations.delete(mutationKey);
+    }
 }
 
 async function toggleAlbumFavourite(albumEntry) {
@@ -7641,16 +7780,34 @@ async function toggleAlbumFavourite(albumEntry) {
     if (!albumId) {
         return;
     }
+    const mutationKey = `album:${albumId}`;
+    if (pendingFavouriteMutations.has(mutationKey)) {
+        return;
+    }
     const nextStarred = !albumEntry.starred;
-    await fetchJson(nextStarred ? "/rest/star.view" : "/rest/unstar.view", { albumId });
-    invalidateBrowseEntryCache();
+    pendingFavouriteMutations.add(mutationKey);
     updateAlbumEverywhere(albumId, (item) => {
         item.starred = nextStarred;
         item.albumStarred = nextStarred;
     });
     renderSongsDrawer();
-    updateUI();
-    flashStatus(nextStarred ? `Favourited album ${albumEntry.title}` : `Removed favourite from album ${albumEntry.title}`);
+    updateBrowseSummary();
+    try {
+        await fetchJson(nextStarred ? "/rest/star.view" : "/rest/unstar.view", { albumId });
+        invalidateBrowseEntryCache();
+        flashStatus(nextStarred ? `Favourited album ${albumEntry.title}` : `Removed favourite from album ${albumEntry.title}`);
+    } catch (error) {
+        updateAlbumEverywhere(albumId, (item) => {
+            item.starred = !nextStarred;
+            item.albumStarred = !nextStarred;
+        });
+        renderSongsDrawer();
+        updateBrowseSummary();
+        flashStatus(`Could not update favourite: ${error?.message || error}`, 2600);
+    } finally {
+        pendingFavouriteMutations.delete(mutationKey);
+        renderSongsDrawer();
+    }
 }
 
 async function toggleDrawerAlbumFavourite() {
@@ -7658,16 +7815,35 @@ async function toggleDrawerAlbumFavourite() {
     if (!albumId) {
         return;
     }
+    const mutationKey = `album:${albumId}`;
+    if (pendingFavouriteMutations.has(mutationKey)) {
+        return;
+    }
     const nextStarred = !state.drawerContext.albumStarred;
-    await fetchJson(nextStarred ? "/rest/star.view" : "/rest/unstar.view", { albumId });
-    invalidateBrowseEntryCache();
+    const title = state.drawerContext.title;
+    pendingFavouriteMutations.add(mutationKey);
     updateAlbumEverywhere(albumId, (item) => {
         item.starred = nextStarred;
         item.albumStarred = nextStarred;
     });
     renderSongsDrawer();
-    updateUI();
-    flashStatus(nextStarred ? `Favourited album ${state.drawerContext.title}` : `Removed favourite from album ${state.drawerContext.title}`);
+    updateBrowseSummary();
+    try {
+        await fetchJson(nextStarred ? "/rest/star.view" : "/rest/unstar.view", { albumId });
+        invalidateBrowseEntryCache();
+        flashStatus(nextStarred ? `Favourited album ${title}` : `Removed favourite from album ${title}`);
+    } catch (error) {
+        updateAlbumEverywhere(albumId, (item) => {
+            item.starred = !nextStarred;
+            item.albumStarred = !nextStarred;
+        });
+        renderSongsDrawer();
+        updateBrowseSummary();
+        flashStatus(`Could not update favourite: ${error?.message || error}`, 2600);
+    } finally {
+        pendingFavouriteMutations.delete(mutationKey);
+        renderSongsDrawer();
+    }
 }
 
 async function getAlbumTracks(albumEntry) {
@@ -7744,20 +7920,44 @@ async function addTrackToPlaylist(track, playlistId) {
         return;
     }
     const playlistKey = String(playlistId);
-    state.detailsCache.delete(`playlist:${playlistKey}`);
     const playlist = await ensurePlaylistDetails(playlistKey);
     if (playlist.tracks.some((playlistTrack) => tracksReferToSameSong(playlistTrack, track))) {
         flashStatus(`${track.title} is already in ${playlist.title || "playlist"}`);
         return;
     }
-    await fetchJson("/rest/updatePlaylist.view", {
-        playlistId: playlistKey,
-        songIdToAdd: track.id,
-    });
+    showStatus(`Adding ${track.title}...`);
+    try {
+        await fetchJson("/rest/updatePlaylist.view", {
+            playlistId: playlistKey,
+            songIdToAdd: track.id,
+        });
+    } catch (error) {
+        hideStatus();
+        flashStatus(`Could not add song: ${error?.message || error}`, 2600);
+        return;
+    }
     invalidateBrowseEntryCache(BROWSE_MODE.PLAYLIST);
-    state.detailsCache.delete(`playlist:${playlistKey}`);
-    clearTrackPlaylistMembershipCache(track);
-    await ensurePlaylistOptions(true);
+    const playlistTrack = {
+        ...track,
+        playlistId: playlistKey,
+        playlistName: playlist.title,
+        playlistIndex: playlist.tracks.length,
+    };
+    playlist.tracks.push(playlistTrack);
+    const playlistOption = state.playlistOptions.find((option) => option.id === playlistKey);
+    if (playlistOption) {
+        playlistOption.songCount = playlist.tracks.length;
+        playlistOption.subtitle = formatSongCount(playlist.tracks.length);
+    }
+    const membershipKey = getTrackPlaylistMembershipCacheKey(track);
+    const memberships = new Map(playlistMembershipCache.get(membershipKey) || []);
+    memberships.set(playlistKey, {
+        playlistId: playlistKey,
+        index: playlist.tracks.length - 1,
+        title: playlist.title || playlistOption?.title || "playlist",
+    });
+    playlistMembershipCache.set(membershipKey, memberships);
+    renderBrowseMenus();
     flashStatus(`Added ${track.title} to ${playlist.title || "playlist"}`);
 }
 
@@ -7869,10 +8069,14 @@ async function handleSongAction(action, index, extra = {}) {
 
     if (action === "add-to-playlist") {
         await ensurePlaylistOptions();
-        await loadTrackPlaylistMemberships(track, { force: true });
         state.activeSongMenuIndex = index;
         state.activeSongMenuMode = "playlist-picker";
         renderSongsDrawer();
+        loadTrackPlaylistMemberships(track).then(() => {
+            if (state.activeSongMenuIndex === index && state.activeSongMenuMode === "playlist-picker") {
+                renderSongsDrawer();
+            }
+        }).catch((error) => console.warn("Could not check playlist memberships", error));
         return;
     }
 
@@ -7955,11 +8159,19 @@ async function handleInfoAction(action, extra = {}) {
 
     if (action === "add-to-playlist") {
         await ensurePlaylistOptions();
-        if (subject.type === "song") {
-            await loadTrackPlaylistMemberships(subject.track, { force: true });
-        }
         state.activeInfoMenuMode = "playlist-picker";
         renderInfoActionMenu();
+        if (subject.type === "song") {
+            const membershipKey = getTrackPlaylistMembershipCacheKey(subject.track);
+            loadTrackPlaylistMemberships(subject.track).then(() => {
+                const activeKey = state.activeInfoMenuSubject?.type === "song"
+                    ? getTrackPlaylistMembershipCacheKey(state.activeInfoMenuSubject.track)
+                    : "";
+                if (state.activeInfoMenuMode === "playlist-picker" && activeKey === membershipKey) {
+                    renderInfoActionMenu();
+                }
+            }).catch((error) => console.warn("Could not check playlist memberships", error));
+        }
         return;
     }
 
@@ -8960,6 +9172,9 @@ function setupInput() {
         if (!actionButton) {
             return;
         }
+        if (actionButton.dataset.action === "play-song" && hasTextSelectionWithin(actionButton)) {
+            return;
+        }
         event.stopPropagation();
         const action = actionButton.dataset.action;
         const index = Number.parseInt(actionButton.dataset.index || "", 10);
@@ -8968,6 +9183,22 @@ function setupInput() {
             playlistIndex: actionButton.dataset.playlistIndex || "",
         });
     });
+    elements.songsDrawer.addEventListener("contextmenu", (event) => {
+        const row = event.target.closest("tr[data-song-index]");
+        if (!row || event.target.closest(".song-context-menu") || hasTextSelectionWithin(row)) {
+            return;
+        }
+        const index = Number.parseInt(row.dataset.songIndex || "", 10);
+        if (!Number.isInteger(index) || !state.drawerContext.items[index]) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        state.activeSongMenuIndex = index;
+        state.activeSongMenuMode = "actions";
+        renderSongsDrawer();
+    });
+    elements.songsTableWrap.addEventListener("scroll", scheduleActiveSongMenuPosition, { passive: true });
     elements.infoPanel.addEventListener("click", (event) => {
         const actionButton = event.target.closest("button[data-info-action]");
         if (!actionButton) {

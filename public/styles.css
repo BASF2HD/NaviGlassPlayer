@@ -403,6 +403,9 @@ body.is-player-fullscreen #controls,
     -webkit-overflow-scrolling: touch;
     scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
     scrollbar-width: thin;
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
 }
 
 .songs-table-wrap::-webkit-scrollbar {
@@ -622,6 +625,9 @@ body.is-player-fullscreen #controls,
     padding: 0;
     overflow: hidden;
     touch-action: manipulation;
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
 }
 
 .song-row-title {
@@ -633,6 +639,7 @@ body.is-player-fullscreen #controls,
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    cursor: text;
 }
 
 .song-row-subtitle {
@@ -644,6 +651,7 @@ body.is-player-fullscreen #controls,
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    cursor: text;
 }
 
 .song-row-actions {
@@ -698,6 +706,11 @@ body.is-player-fullscreen #controls,
     overscroll-behavior: contain;
     scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
     scrollbar-width: thin;
+}
+
+.song-row-actions > .song-context-menu.opens-up {
+    top: auto;
+    bottom: 0;
 }
 
 .song-context-menu.is-playlist-picker {
@@ -805,6 +818,9 @@ body.is-player-fullscreen #controls,
     overflow: auto;
     scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
     scrollbar-width: thin;
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
 }
 
 .song-info-grid {
@@ -839,12 +855,14 @@ body.is-player-fullscreen #controls,
     letter-spacing: 1px;
     text-transform: uppercase;
     color: rgba(164, 176, 221, 0.64);
+    cursor: text;
 }
 
 .song-info-value {
     font-size: var(--drawer-info-value-size);
     color: rgba(240, 243, 252, 0.92);
     white-space: nowrap;
+    cursor: text;
 }
 
 /* =============================================================
