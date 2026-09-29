@@ -36,6 +36,14 @@ https://basf2hd.github.io/NaviGlassPlayer/
 - CSV export for favourite songs, favourite albums, and selected playlists
 - Local Node proxy so Navidrome credentials and media stay on the configured server path
 
+## Audio Playback And Keyboard Controls
+
+Playback requests the original file (`format=raw`, with no bitrate limit) when the browser reports support for its format, including MP3, WAV, FLAC, AAC/MP4, Ogg, and Opus. Actual support depends on the browser and the codec inside the file. Unsupported formats or native decoder failures fall back to a 320 kbps MP3 compatibility stream; that fallback is lossy, not hi-res playback.
+
+Audio streams begin progressively while the server fills its file cache. Original-file seeks forward byte-range requests immediately rather than waiting for the entire song to download. Completed cache files support byte-range seeking. Network speed and browser decoding still affect how quickly an uncached seek can resume.
+
+Press Down to open the song drawer, then Up or Down to select a song and Enter to play it. Space toggles playback with the drawer open or closed. With the drawer closed, Enter plays the centered album's first song or the centered song. Drawer numbers use album track metadata when available, or the visible row number when it is missing; playlists use their row order.
+
 ## Export Music Lists
 
 Open **Settings → Export music lists** to create a UTF-8 CSV for filtering and curating saved music.

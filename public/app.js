@@ -22,6 +22,11 @@ import {
     normalizeAlbumGroupTitle,
 } from "./album-identity.js?v=1";
 import { resolveVerticalMenuPlacement } from "./context-menu-position.js?v=1";
+import {
+    resolveDrawerDisplayNumber,
+    stepDrawerSelectionIndex,
+} from "./drawer-navigation.js?v=1";
+import { audioStreamParams, isTimeInRanges, needsSeekRecovery } from "./audio-seek.js?v=1";
 
 const STORAGE_KEY = "naviglassplayer-settings";
 const LEGACY_SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
@@ -44,7 +49,7 @@ const CACHE_DB_NAME = "naviglassplayer-cache";
 const CACHE_DB_VERSION = 1;
 const BROWSE_CACHE_STORE = "browseViews";
 const ARTWORK_CACHE_STORE = "artwork";
-const BROWSE_CACHE_SCHEMA_VERSION = 4;
+const BROWSE_CACHE_SCHEMA_VERSION = 5;
 const PERSISTENT_BROWSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PERSISTENT_ARTWORK_ITEMS = 3500;
 const STREAM_CACHE_SEEK_WAIT_MS = 45000;
@@ -259,6 +264,11 @@ let streamRecoveryAttempts = 0;
 let streamRecoveryTrackKey = "";
 let seekRetryTimerId = 0;
 let seekPrepareId = 0;
+let seekPointerActive = false;
+let pendingSeek = null;
+const nativeStreamFallbackKeys = new Set();
+let compatibleStreamFallbackKey = "";
+let browsePlayRequestId = 0;
 let streamCacheReadyKeys = new Set();
 let streamCacheHandoffDoneKeys = new Set();
 let streamCacheHandoffTimerId = 0;
@@ -307,7 +317,9 @@ const state = {
     savedRadioStations: [],
     playerFullscreen: false,
     drawerOpen: false,
+    pendingBrowseIndex: null,
     drawerContext: { key: "", title: "Songs", subtitle: "", items: [], loading: false, albumId: "", albumStarred: false },
+    drawerSelectionIndex: null,
     activeSongMenuIndex: null,
     activeSongMenuMode: "actions",
     activeInfoMenuMode: "closed",
@@ -1075,8 +1087,7 @@ function shouldUsePhoneSeekCache() {
 
 function isServerCachedTrack(track) {
     return Boolean(
-        shouldUsePhoneSeekCache()
-        && track?.id
+        track?.id
         && !track.previewUrl
         && !track.streamUrl
         && track.kind !== "radio"
@@ -1084,11 +1095,17 @@ function isServerCachedTrack(track) {
 }
 
 function serverStreamCacheKey(track) {
-    return isServerCachedTrack(track) ? `${track.id}|mp3|320` : "";
+    const params = serverStreamParams(track);
+    return isServerCachedTrack(track) ? `${track.id}|${params.format}|${params.maxBitRate}` : "";
 }
 
 function serverStreamParams(track) {
-    return { id: track?.id, format: "mp3", maxBitRate: 320 };
+    return audioStreamParams(track, (mimeType) => elements.audioPlayer.canPlayType(mimeType),
+        nativeStreamFallbackKeys.has(`${state.settings.serverUrl}|${track?.id}`));
+}
+
+function usesCachedPlaybackRoute(track) {
+    return isServerCachedTrack(track);
 }
 
 function warmServerStreamCache(track) {
@@ -1165,7 +1182,7 @@ function cacheReadyPlaybackUrl(track) {
 }
 
 async function switchPhonePlaybackToCachedStream(track, trackKey) {
-    if (streamCacheHandoffInProgress || !isServerCachedTrack(track)) {
+    if (streamCacheHandoffInProgress || pendingSeek || seekPointerActive || !isServerCachedTrack(track)) {
         return;
     }
     if (streamCacheHandoffDoneKeys.has(trackKey)) {
@@ -1176,6 +1193,7 @@ async function switchPhonePlaybackToCachedStream(track, trackKey) {
     }
 
     const shouldResume = playbackIntentPlaying || !elements.audioPlayer.paused;
+    const prepareId = seekPrepareId;
     const resumeAt = Math.max(0, Number(elements.audioPlayer.currentTime || playbackState.elapsed || 0));
     streamCacheHandoffInProgress = true;
     try {
@@ -1183,19 +1201,18 @@ async function switchPhonePlaybackToCachedStream(track, trackKey) {
         elements.audioPlayer.src = cacheReadyPlaybackUrl(track);
         elements.audioPlayer.load();
         await waitForAudioReady(3200);
-        if (!state.currentTrack || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
+        if (prepareId !== seekPrepareId || !state.currentTrack || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
             return;
         }
         streamCacheHandoffDoneKeys.add(trackKey);
         if (resumeAt > 0) {
             setAudioCurrentTime(resumeAt);
         }
-        if (shouldResume) {
-            playbackIntentPlaying = true;
+        if (shouldResume && playbackIntentPlaying) {
             await elements.audioPlayer.play().catch((error) => {
                 if (error?.name !== "AbortError") {
                     playbackIntentPlaying = false;
-                    flashStatus("Browser playback was blocked.", 2200);
+                    reportPlaybackFailure(error);
                 }
             });
         }
@@ -1204,9 +1221,9 @@ async function switchPhonePlaybackToCachedStream(track, trackKey) {
     }
 }
 
-function schedulePhoneStreamCacheHandoff(track = state.currentTrack) {
+function scheduleStreamCacheHandoff(track = state.currentTrack) {
     clearStreamCacheHandoffTimer();
-    if (!isServerCachedTrack(track)) {
+    if (!isServerCachedTrack(track) || serverStreamParams(track).format === "raw") {
         return;
     }
     const trackKey = getTrackRecoveryKey(track);
@@ -1223,15 +1240,17 @@ function schedulePhoneStreamCacheHandoff(track = state.currentTrack) {
         }
         try {
             const status = await getServerStreamCacheStatus(track);
-            if (status?.ready) {
-                await switchPhonePlaybackToCachedStream(track, trackKey);
+            if (status?.ready && !pendingSeek && !seekPointerActive) {
+                // Desktop keeps its source; phones also use the completed file
+                // to recover interrupted transcoded streams.
+                if (shouldUsePhoneSeekCache()) await switchPhonePlaybackToCachedStream(track, trackKey);
                 return;
             }
         } catch {
             // Keep polling; the cache warm-up may still be underway.
         }
         if (state.currentTrack && getTrackRecoveryKey(state.currentTrack) === trackKey && playbackIntentPlaying) {
-            schedulePhoneStreamCacheHandoff(track);
+            scheduleStreamCacheHandoff(track);
         }
     }, STREAM_CACHE_HANDOFF_POLL_MS);
 }
@@ -1244,20 +1263,20 @@ function coverArtUrl(entry, size = 700) {
     return buildProxyUrl("/rest/getCoverArt.view", { id, size }, { expectsJson: false });
 }
 
-function streamUrl(trackId) {
-    return buildProxyUrl("/rest/stream.view", { id: trackId, format: "mp3", maxBitRate: 320 }, { expectsJson: false });
+function streamUrl(track) {
+    return buildProxyUrl("/rest/stream.view", serverStreamParams(track), { expectsJson: false });
 }
 
 function playbackUrl(track) {
     if (track?.previewUrl || track?.streamUrl) {
         return track.previewUrl || track.streamUrl;
     }
-    if (!isServerCachedTrack(track)) {
-        return streamUrl(track?.id);
+    if (!usesCachedPlaybackRoute(track)) {
+        return streamUrl(track);
     }
     return buildServerApiUrl(
         "/api/cache/navidrome/stream",
-        { id: track?.id, format: "mp3", maxBitRate: 320 },
+        serverStreamParams(track),
         { expectsJson: false }
     );
 }
@@ -1325,7 +1344,7 @@ function normalizeTrack(track, options = {}) {
         albumId,
         coverArt: track.coverArt || options.coverArt || albumId || id || "",
         duration: Number(track.duration || 0),
-        trackNo: Number(track.track || options.trackNo || options.index + 1 || 0),
+        trackNo: Number(track.track || options.trackNo || 0),
         bitRate: Number(track.bitRate || track.bitrate || 0),
         suffix: pickText(track.suffix, options.suffix),
         year,
@@ -3395,6 +3414,7 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
     }
 
     const requestId = ++browseLoadId;
+    state.pendingBrowseIndex = null;
     progressiveAlbumLoad = null;
     let nextBrowseMode = state.browseMode;
     const nextBrowseCacheKey = getBrowseEntryCacheKey(nextBrowseMode);
@@ -4738,7 +4758,9 @@ function getDisplayedTimeline() {
     const duration = Number.isFinite(audio.duration) && audio.duration > 0
         ? audio.duration
         : playbackState.duration;
-    const elapsed = Number.isFinite(audio.currentTime) ? audio.currentTime : playbackState.elapsed;
+    const elapsed = seekPointerActive ? playbackState.elapsed
+        : pendingSeek ? pendingSeek.target
+        : Number.isFinite(audio.currentTime) ? audio.currentTime : playbackState.elapsed;
     return {
         elapsed: Math.max(0, elapsed || 0),
         duration: Math.max(0, duration || 0),
@@ -5984,6 +6006,61 @@ function positionInfoPanel() {
     elements.songInfoCard.style.height = `${drawerHeight}px`;
 }
 
+function getCurrentDrawerTrackIndex(items = state.drawerContext.items || []) {
+    if (!state.currentTrack) return -1;
+    return items.findIndex(({ track }) => Boolean(
+        (track?.id && track.id === state.currentTrack.id) ||
+        (track?.file && track.file === state.currentTrack.file)
+    ));
+}
+
+function ensureDrawerSelectionIndex(items = state.drawerContext.items || []) {
+    if (!items.length) {
+        state.drawerSelectionIndex = null;
+        return -1;
+    }
+    if (
+        Number.isInteger(state.drawerSelectionIndex) &&
+        state.drawerSelectionIndex >= 0 &&
+        state.drawerSelectionIndex < items.length
+    ) {
+        return state.drawerSelectionIndex;
+    }
+    const currentIndex = getCurrentDrawerTrackIndex(items);
+    state.drawerSelectionIndex = currentIndex >= 0 ? currentIndex : 0;
+    return state.drawerSelectionIndex;
+}
+
+function scrollDrawerSelectionIntoView() {
+    if (!Number.isInteger(state.drawerSelectionIndex)) return;
+    const row = elements.songsTableBody.querySelector(
+        `tr[data-song-index="${state.drawerSelectionIndex}"]`
+    );
+    row?.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+function setDrawerSelectionIndex(index, { scroll = true } = {}) {
+    const itemCount = state.drawerContext.items?.length || 0;
+    if (!itemCount) {
+        state.drawerSelectionIndex = null;
+        return;
+    }
+    state.drawerSelectionIndex = clamp(Number(index) || 0, 0, itemCount - 1);
+    state.activeSongMenuIndex = null;
+    state.activeSongMenuMode = "actions";
+    renderSongsDrawer();
+    if (scroll) window.requestAnimationFrame(scrollDrawerSelectionIntoView);
+}
+
+function moveDrawerSelection(delta) {
+    const nextIndex = stepDrawerSelectionIndex(
+        state.drawerSelectionIndex,
+        delta,
+        state.drawerContext.items?.length || 0
+    );
+    if (nextIndex >= 0) setDrawerSelectionIndex(nextIndex);
+}
+
 function renderSongsDrawer() {
     const context = state.drawerContext;
     const items = context.items || [];
@@ -6018,6 +6095,7 @@ function renderSongsDrawer() {
     }
 
     if (context.loading) {
+        state.drawerSelectionIndex = null;
         elements.songsTableBody.innerHTML = `
             <tr class="songs-empty-row">
                 <td colspan="4">Loading songs…</td>
@@ -6027,12 +6105,19 @@ function renderSongsDrawer() {
     }
 
     if (!items.length) {
+        state.drawerSelectionIndex = null;
         elements.songsTableBody.innerHTML = `
             <tr class="songs-empty-row">
                 <td colspan="4">No songs available for this view yet.</td>
             </tr>
         `;
         return;
+    }
+
+    if (state.drawerOpen) {
+        ensureDrawerSelectionIndex(items);
+    } else {
+        state.drawerSelectionIndex = null;
     }
 
     elements.songsTableBody.innerHTML = items
@@ -6045,11 +6130,16 @@ function renderSongsDrawer() {
                 rowAlbumMatchesHeader ? "" : track?.album,
             ].filter(Boolean).join("  ·  "));
             const isCurrent = track?.id && state.currentTrack?.id === track.id;
+            const isSelected = state.drawerSelectionIndex === rowIndex;
             const menuOpen = state.activeSongMenuIndex === rowIndex;
             const playlistPickerOpen = menuOpen && state.activeSongMenuMode === "playlist-picker";
             const canRemoveFromPlaylist = Boolean(state.drawerContext.playlistId);
             const subject = { type: "song", track };
-            const displayNr = context.playlistId ? rowIndex + 1 : track?.trackNo || index + 1;
+            const displayNr = resolveDrawerDisplayNumber({
+                trackNo: track?.trackNo,
+                rowIndex,
+                forceRowOrder: Boolean(context.playlistId),
+            });
             const currentStatusLabel = playbackState.playing ? "Now playing" : "Current track";
             const rowNumberHtml = isCurrent
                 ? `
@@ -6075,7 +6165,7 @@ function renderSongsDrawer() {
             `;
 
             return `
-                <tr class="${[isCurrent ? "is-current" : "", menuOpen ? "is-menu-open" : ""].filter(Boolean).join(" ")}" data-song-index="${rowIndex}" ${isCurrent ? 'aria-current="true"' : ""}>
+                <tr class="${[isCurrent ? "is-current" : "", isSelected ? "is-keyboard-selected" : "", menuOpen ? "is-menu-open" : ""].filter(Boolean).join(" ")}" data-song-index="${rowIndex}" aria-selected="${isSelected}" ${isCurrent ? 'aria-current="true"' : ""}>
                     <td class="song-row-nr">${rowNumberHtml}</td>
                     <td class="song-row-title-cell">
                         <button class="song-row-title-wrap" data-action="play-song" data-index="${rowIndex}">
@@ -6345,8 +6435,13 @@ async function setSongsDrawerOpen(open) {
         state.activeDropdown = null;
         renderBrowseMenus();
         renderSongsDrawer();
+        elements.songsDrawer.focus({ preventScroll: true });
         await ensureDrawerContext();
+        ensureDrawerSelectionIndex();
+        renderSongsDrawer();
+        window.requestAnimationFrame(scrollDrawerSelectionIntoView);
     } else {
+        state.drawerSelectionIndex = null;
         state.activeSongMenuIndex = null;
         state.activeSongMenuMode = "actions";
         hideSongInfo();
@@ -7276,6 +7371,7 @@ function syncBrowseToTrack(track) {
     if (nextIndex < 0) {
         return;
     }
+    state.pendingBrowseIndex = null;
 
     // Let the naviglassplayer finish scrolling before we commit the new centered
     // entry in app state. Otherwise the info panel/slider jump early and the
@@ -7301,6 +7397,7 @@ function animateBrowseBackToTrack(track) {
     if (targetIndex < 0) {
         return;
     }
+    state.pendingBrowseIndex = null;
     ensureTextures(targetIndex);
     navigateTo(targetIndex);
 }
@@ -7377,23 +7474,26 @@ async function playTrackList(tracks, index, queueKey) {
     seekRetryTimerId = 0;
     clearStreamCacheHandoffTimer();
     seekPrepareId += 1;
+    pendingSeek = null;
 
     elements.audioPlayer.preload = "auto";
     elements.audioPlayer.src = playbackUrl(state.currentTrack);
+    const sourceAtPlay = elements.audioPlayer.src;
     elements.audioPlayer.load();
-    warmServerStreamCache(state.currentTrack);
+    if (!usesCachedPlaybackRoute(state.currentTrack)) warmServerStreamCache(state.currentTrack);
     playbackIntentPlaying = true;
-    schedulePhoneStreamCacheHandoff(state.currentTrack);
+    scheduleStreamCacheHandoff(state.currentTrack);
 
     try {
         await elements.audioPlayer.play();
     } catch (error) {
+        if (elements.audioPlayer.src !== sourceAtPlay) return;
+        if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream()) return;
         if (error?.name === "AbortError") {
             // Benign: play() was superseded by a newer pause()/load(), e.g. user clicked another track quickly.
         } else {
             playbackIntentPlaying = false;
-            console.error(error);
-            flashStatus("Browser playback was blocked.", 2200);
+            reportPlaybackFailure(error);
         }
     }
 
@@ -7411,7 +7511,7 @@ async function cmdPlayPause() {
             await elements.audioPlayer.play().catch((error) => {
                 if (error?.name !== "AbortError") {
                     playbackIntentPlaying = false;
-                    flashStatus("Browser playback was blocked.", 2200);
+                    reportPlaybackFailure(error);
                 }
             });
         } else {
@@ -7437,6 +7537,17 @@ async function cmdPlayPause() {
     if (state.drawerOpen) {
         setSongsDrawerOpen(false);
     }
+}
+
+async function cmdPlaySelectedEntry() {
+    const requestId = ++browsePlayRequestId;
+    const context = await getPlaybackContextForEntry(getCurrentBrowseEntry());
+    if (requestId !== browsePlayRequestId) return;
+    if (!context.tracks.length) {
+        flashStatus("No tracks available for this item.", 2200);
+        return;
+    }
+    await playTrackList(context.tracks, context.startIndex, context.key);
 }
 
 function isEntryCurrentlyPlaying(entry) {
@@ -7525,6 +7636,18 @@ function getTrackRecoveryKey(track = state.currentTrack) {
     return pickText(track?.id, track?.streamUrl, track?.previewUrl, track?.key);
 }
 
+function reportPlaybackFailure(error) {
+    if (error?.name === "AbortError") return;
+    if (error?.name === "NotAllowedError") {
+        flashStatus("Browser playback was blocked.", 2200);
+    } else if (error?.name === "NotSupportedError") {
+        flashStatus("This audio format is not supported here.", 2400);
+    } else {
+        flashStatus("Could not load this song.", 2200);
+    }
+    console.error(error);
+}
+
 function setAudioCurrentTime(seconds) {
     if (!Number.isFinite(seconds)) {
         return elements.audioPlayer.currentTime || 0;
@@ -7532,13 +7655,9 @@ function setAudioCurrentTime(seconds) {
     const duration = getSeekDuration();
     const target = duration > 0 ? clamp(seconds, 0, duration) : Math.max(0, seconds);
     try {
-        if (typeof elements.audioPlayer.fastSeek === "function") {
-            elements.audioPlayer.fastSeek(target);
-        } else {
-            elements.audioPlayer.currentTime = target;
-        }
-    } catch {
         elements.audioPlayer.currentTime = target;
+    } catch {
+        return elements.audioPlayer.currentTime || 0;
     }
     playbackState.elapsed = target;
     playbackState.timelineUpdatedAt = Date.now();
@@ -7547,6 +7666,7 @@ function setAudioCurrentTime(seconds) {
 }
 
 function waitForAudioReady(timeoutMs = 1800) {
+    if (elements.audioPlayer.readyState >= 1) return Promise.resolve();
     return new Promise((resolve) => {
         let settled = false;
         const done = () => {
@@ -7565,7 +7685,7 @@ function waitForAudioReady(timeoutMs = 1800) {
     });
 }
 
-function scheduleSeekCommitCheck(target, wasPlaying) {
+function scheduleSeekCommitCheck(target) {
     const trackKey = getTrackRecoveryKey();
     if (!trackKey || state.currentTrack?.kind === "radio") {
         return;
@@ -7574,31 +7694,44 @@ function scheduleSeekCommitCheck(target, wasPlaying) {
     window.clearTimeout(seekRetryTimerId);
     seekRetryTimerId = window.setTimeout(async () => {
         seekRetryTimerId = 0;
-        if (!state.currentTrack || getTrackRecoveryKey() !== trackKey) {
+        if (prepareId !== seekPrepareId || !pendingSeek || getTrackRecoveryKey() !== trackKey) {
             return;
         }
-        const current = Number(elements.audioPlayer.currentTime || 0);
-        if (Math.abs(current - target) < 2 || elements.audioPlayer.seeking) {
+        if (!needsSeekRecovery(elements.audioPlayer, target)) {
+            pendingSeek = null;
+            updatePlaybackStripUI();
+            scheduleStreamCacheHandoff();
             return;
         }
+        // An original file can fetch the requested range directly; reloading it
+        // would cancel that request and throw away its progressive buffer.
+        if (serverStreamParams(state.currentTrack).format === "raw") return;
+        flashStatus("Seeking...", 1800);
         if (isServerCachedTrack(state.currentTrack)) {
             const ready = await waitForServerStreamCacheReady(state.currentTrack, prepareId);
-            if (!ready || prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey) {
+            if (!ready || prepareId !== seekPrepareId || !pendingSeek || getTrackRecoveryKey() !== trackKey) {
+                if (!ready && prepareId === seekPrepareId && pendingSeek) {
+                    pendingSeek = null;
+                    updatePlaybackStripUI();
+                    flashStatus("Could not prepare this seek. Please try again.", 2200);
+                }
                 return;
             }
         }
+        if (!pendingSeek || !needsSeekRecovery(elements.audioPlayer, target)) return;
         elements.audioPlayer.preload = "auto";
-        elements.audioPlayer.src = playbackUrl(state.currentTrack);
+        elements.audioPlayer.src = isServerCachedTrack(state.currentTrack)
+            ? cacheReadyPlaybackUrl(state.currentTrack) : playbackUrl(state.currentTrack);
         elements.audioPlayer.load();
         await waitForAudioReady(3200);
-        if (!state.currentTrack || getTrackRecoveryKey() !== trackKey) {
+        if (prepareId !== seekPrepareId || !pendingSeek || getTrackRecoveryKey() !== trackKey) {
             return;
         }
         setAudioCurrentTime(target);
-        if (wasPlaying) {
+        if (playbackIntentPlaying) {
             await elements.audioPlayer.play().catch((error) => {
                 if (error?.name !== "AbortError") {
-                    flashStatus("Browser playback was blocked.", 2200);
+                    reportPlaybackFailure(error);
                 }
             });
         }
@@ -7644,6 +7777,36 @@ async function recoverInterruptedTrackPlayback() {
     }
 }
 
+async function fallbackToCompatibleStream() {
+    const track = state.currentTrack;
+    const trackKey = getTrackRecoveryKey(track);
+    if (trackKey && compatibleStreamFallbackKey === trackKey) return true;
+    if (!isServerCachedTrack(track) || serverStreamParams(track).format !== "raw"
+        || ![3, 4].includes(elements.audioPlayer.error?.code)) return false;
+    const prepareId = seekPrepareId;
+    const resumeAt = pendingSeek?.target || elements.audioPlayer.currentTime || 0;
+    compatibleStreamFallbackKey = trackKey;
+    nativeStreamFallbackKeys.add(`${state.settings.serverUrl}|${track.id}`);
+    try {
+        elements.audioPlayer.src = playbackUrl(track);
+        elements.audioPlayer.load();
+        await waitForAudioReady(3200);
+        if (prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey) return true;
+        if (resumeAt > 0) setAudioCurrentTime(resumeAt);
+        if (playbackIntentPlaying) {
+            await elements.audioPlayer.play().catch((error) => {
+                if (prepareId === seekPrepareId && getTrackRecoveryKey() === trackKey && error?.name !== "AbortError") {
+                    playbackIntentPlaying = false;
+                    reportPlaybackFailure(error);
+                }
+            });
+        }
+    } finally {
+        if (compatibleStreamFallbackKey === trackKey) compatibleStreamFallbackKey = "";
+    }
+    return true;
+}
+
 async function cmdSeek(seconds) {
     if (!Number.isFinite(seconds)) {
         return;
@@ -7656,41 +7819,33 @@ async function cmdSeek(seconds) {
     const trackKey = getTrackRecoveryKey(trackAtSeek);
     const prepareId = seekPrepareId + 1;
     seekPrepareId = prepareId;
+    window.clearTimeout(seekRetryTimerId);
+    clearStreamCacheHandoffTimer();
     const shouldResume = !elements.audioPlayer.paused || playbackIntentPlaying;
+    playbackIntentPlaying = shouldResume;
     const target = clamp(seconds, 0, duration);
+    pendingSeek = { target, prepareId, trackKey };
     playbackState.elapsed = target;
     playbackState.timelineUpdatedAt = Date.now();
     updatePlaybackStripUI();
 
-    const cacheKey = serverStreamCacheKey(trackAtSeek);
-    if (cacheKey && !streamCacheReadyKeys.has(cacheKey)) {
-        flashStatus("Seeking...", 1800);
-        const ready = await waitForServerStreamCacheReady(trackAtSeek, prepareId);
-        if (prepareId !== seekPrepareId || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
-            return;
-        }
-        if (!ready) {
-            flashStatus("Still seeking...", 2200);
-            scheduleSeekCommitCheck(target, shouldResume);
-            return;
-        }
-        elements.audioPlayer.preload = "auto";
-        elements.audioPlayer.src = playbackUrl(trackAtSeek);
+    if (serverStreamParams(trackAtSeek).format !== "raw"
+        && !isTimeInRanges(elements.audioPlayer.buffered, target)
+        && streamCacheReadyKeys.has(serverStreamCacheKey(trackAtSeek))) {
+        elements.audioPlayer.src = cacheReadyPlaybackUrl(trackAtSeek);
         elements.audioPlayer.load();
         await waitForAudioReady(3200);
-        if (prepareId !== seekPrepareId || getTrackRecoveryKey(state.currentTrack) !== trackKey) {
-            return;
-        }
+        if (prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey) return;
+        streamCacheHandoffDoneKeys.add(trackKey);
     }
-
     setAudioCurrentTime(target);
-    scheduleSeekCommitCheck(target, shouldResume);
-    if (shouldResume) {
-        playbackIntentPlaying = true;
+    scheduleSeekCommitCheck(target);
+    if (shouldResume && playbackIntentPlaying) {
         await elements.audioPlayer.play().catch((error) => {
+            if (prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey) return;
             if (error?.name !== "AbortError") {
                 playbackIntentPlaying = false;
-                flashStatus("Browser playback was blocked.", 2200);
+                reportPlaybackFailure(error);
             }
         });
     }
@@ -8259,6 +8414,8 @@ function handleSnap(index) {
     if (!browseEntries.length) {
         return;
     }
+    if (state.pendingBrowseIndex != null && index !== state.pendingBrowseIndex) return;
+    state.pendingBrowseIndex = null;
     state.browseIndex = clamp(index, 0, browseEntries.length - 1);
     state.activeEntryKey = browseEntries[state.browseIndex]?.key || null;
     state.activeInfoMenuMode = "closed";
@@ -8393,6 +8550,7 @@ function navigateBrowseToIndex(nextIndex) {
     }
 
     state.browseIndex = clampedIndex;
+    state.pendingBrowseIndex = clampedIndex;
     state.activeEntryKey = browseEntries[clampedIndex]?.key || null;
     updateBrowseSummary();
     navigateTo(clampedIndex);
@@ -8544,7 +8702,7 @@ function setupAudio() {
         playbackState.timelineUpdatedAt = Date.now();
         updateUI();
         scheduleSnapBackToPlaying();
-        schedulePhoneStreamCacheHandoff(state.currentTrack);
+        scheduleStreamCacheHandoff(state.currentTrack);
     });
 
     elements.audioPlayer.addEventListener("pause", () => {
@@ -8555,9 +8713,22 @@ function setupAudio() {
     });
 
     elements.audioPlayer.addEventListener("timeupdate", () => {
+        if (seekPointerActive || pendingSeek) return;
         playbackState.elapsed = elements.audioPlayer.currentTime || 0;
         playbackState.timelineUpdatedAt = Date.now();
         updatePlaybackStripUI();
+    });
+
+    elements.audioPlayer.addEventListener("seeked", () => {
+        if (pendingSeek && pendingSeek.prepareId === seekPrepareId
+            && pendingSeek.trackKey === getTrackRecoveryKey()
+            && Math.abs(elements.audioPlayer.currentTime - pendingSeek.target) < 1) {
+            pendingSeek = null;
+            window.clearTimeout(seekRetryTimerId);
+            playbackState.elapsed = elements.audioPlayer.currentTime;
+            updatePlaybackStripUI();
+            scheduleStreamCacheHandoff();
+        }
     });
 
     elements.audioPlayer.addEventListener("loadedmetadata", () => {
@@ -8593,6 +8764,7 @@ function setupAudio() {
     });
 
     elements.audioPlayer.addEventListener("error", async () => {
+        if (await fallbackToCompatibleStream()) return;
         if (scheduleRadioPreviewReconnect()) {
             return;
         }
@@ -9178,6 +9350,9 @@ function setupInput() {
         event.stopPropagation();
         const action = actionButton.dataset.action;
         const index = Number.parseInt(actionButton.dataset.index || "", 10);
+        if (Number.isInteger(index) && state.drawerContext.items[index]) {
+            state.drawerSelectionIndex = index;
+        }
         handleSongAction(action, index, {
             playlistId: actionButton.dataset.playlistId || "",
             playlistIndex: actionButton.dataset.playlistIndex || "",
@@ -9194,6 +9369,7 @@ function setupInput() {
         }
         event.preventDefault();
         event.stopPropagation();
+        state.drawerSelectionIndex = index;
         state.activeSongMenuIndex = index;
         state.activeSongMenuMode = "actions";
         renderSongsDrawer();
@@ -9212,7 +9388,6 @@ function setupInput() {
         });
     });
 
-    let seekPointerActive = false;
     let activeSeekPointerId = null;
     let lastSeekInteractionAt = 0;
 
@@ -9225,6 +9400,10 @@ function setupInput() {
             return;
         }
         seekPointerActive = true;
+        seekPrepareId += 1;
+        pendingSeek = null;
+        window.clearTimeout(seekRetryTimerId);
+        clearStreamCacheHandoffTimer();
         activeSeekPointerId = event.pointerId;
         lastSeekInteractionAt = Date.now();
         elements.seekTrack.classList.add("is-seeking");
@@ -9294,9 +9473,11 @@ function setupInput() {
         }
         if (event.key === "ArrowLeft") {
             event.preventDefault();
+            event.stopPropagation();
             await cmdSeek((elements.audioPlayer.currentTime || 0) - 5);
         } else if (event.key === "ArrowRight") {
             event.preventDefault();
+            event.stopPropagation();
             await cmdSeek((elements.audioPlayer.currentTime || 0) + 5);
         }
     });
@@ -9692,18 +9873,56 @@ function setupInput() {
         if (isTextEntryTarget(event.target)) {
             return;
         }
+        if (!elements.connectModal.classList.contains("hidden")
+            || !elements.exportModal.classList.contains("hidden") || state.infoTrackIndex != null) return;
 
         if (state.drawerOpen) {
+            if (state.infoTrackIndex != null || !elements.exportModal.classList.contains("hidden")) {
+                return;
+            }
+            if (event.key === "ArrowDown") {
+                event.preventDefault();
+                moveDrawerSelection(1);
+            } else if (event.key === "ArrowUp") {
+                event.preventDefault();
+                moveDrawerSelection(-1);
+            } else if (event.key === " ") {
+                event.preventDefault();
+                if (!event.repeat) cmdPlayPause();
+            } else if (event.key === "Enter") {
+                const focusedButton = event.target instanceof HTMLElement
+                    ? event.target.closest("button")
+                    : null;
+                if (focusedButton && elements.songsDrawer.contains(focusedButton)) {
+                    return;
+                }
+                event.preventDefault();
+                if (!event.repeat && Number.isInteger(state.drawerSelectionIndex)) {
+                    handleSongAction("play-song", state.drawerSelectionIndex).catch((error) => {
+                        console.error(error);
+                        flashStatus("Could not play this song.", 2200);
+                    });
+                }
+            }
             return;
         }
 
-        if (event.key === "ArrowLeft") {
+        if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setSongsDrawerOpen(true);
+        } else if (event.key === "ArrowLeft") {
             navigateBrowseBy(-1);
         } else if (event.key === "ArrowRight") {
             navigateBrowseBy(1);
         } else if (event.key === " ") {
             event.preventDefault();
             cmdPlayPause();
+        } else if (event.key === "Enter") {
+            event.preventDefault();
+            if (!event.repeat) cmdPlaySelectedEntry().catch((error) => {
+                console.error(error);
+                flashStatus("Could not play this item.", 2200);
+            });
         }
     });
 }

@@ -6,6 +6,7 @@ import { mkdir, rename, stat, unlink } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { pipeline } from "node:stream/promises";
 
 const rootDir = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(rootDir, "public");
@@ -33,6 +34,7 @@ const navidromeAlbumWarmMaxItems = Number(process.env.ALBUM_CACHE_WARM_MAX_ITEMS
 const navidromeProxyTimeoutMs = Number(process.env.NAVIDROME_PROXY_TIMEOUT_MS || 12000);
 const audioCacheDir = process.env.AUDIO_CACHE_DIR || join(rootDir, ".cache", "audio");
 const audioCacheInflight = new Map();
+const audioCacheAuthorizations = new Map();
 const audioCacheSeekWaitMs = Number(process.env.AUDIO_CACHE_SEEK_WAIT_MS || 12000);
 
 const mimeTypes = {
@@ -166,7 +168,10 @@ function audioCacheInfoFromRequest(requestUrl) {
   const digest = createHash("sha256")
     .update(`${scope}|stream:${trackId}|${format}|${maxBitRate}`)
     .digest("hex");
-  const extension = format && /^[a-z0-9]{2,5}$/.test(format) ? format : "mp3";
+  const sourceSuffix = String(requestUrl.searchParams.get("suffix") || "").toLowerCase();
+  const extension = format === "raw" && /^[a-z0-9]{2,5}$/.test(sourceSuffix)
+    ? sourceSuffix : format && /^[a-z0-9]{2,5}$/.test(format) ? format : "mp3";
+  const audioMimeTypes = { mp3: "audio/mpeg", flac: "audio/flac", m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg", opus: "audio/ogg", wav: "audio/wav" };
   return {
     trackId,
     format,
@@ -174,7 +179,7 @@ function audioCacheInfoFromRequest(requestUrl) {
     key: digest,
     filePath: join(audioCacheDir, `${digest}.${extension}`),
     tmpPath: join(audioCacheDir, `${digest}.${process.pid}.tmp`),
-    contentType: extension === "mp3" ? "audio/mpeg" : "application/octet-stream"
+    contentType: audioMimeTypes[extension] || "application/octet-stream"
   };
 }
 
@@ -187,7 +192,29 @@ async function cachedAudioReady(info) {
   }
 }
 
-function downloadAudioToCache(requestUrl, info) {
+function audioAuthorizationKey(requestUrl) {
+  const credentials = ["p", "s", "t"].map((name) => requestUrl.searchParams.get(name) || "");
+  return createHash("sha256").update(JSON.stringify([navidromeScopeFromRequest(requestUrl), credentials])).digest("hex");
+}
+
+function rememberAudioAuthorization(requestUrl) {
+  const key = audioAuthorizationKey(requestUrl);
+  if (audioCacheAuthorizations.size >= 5000) audioCacheAuthorizations.delete(audioCacheAuthorizations.keys().next().value);
+  audioCacheAuthorizations.set(key, Date.now() + 60000);
+}
+
+async function authorizeCachedAudio(requestUrl) {
+  if (!requestUrl.searchParams.get("u") || !(requestUrl.searchParams.get("p") || (requestUrl.searchParams.get("s") && requestUrl.searchParams.get("t")))) {
+    throw new Error("Missing Navidrome credentials");
+  }
+  if (audioCacheAuthorizations.get(audioAuthorizationKey(requestUrl)) > Date.now()) return;
+  const pingUrl = new URL(requestUrl);
+  pingUrl.searchParams.set("f", "json");
+  await fetchNavidromeJsonFromClientRequest(pingUrl, "/rest/ping.view");
+  rememberAudioAuthorization(requestUrl);
+}
+
+function downloadAudioToCache(requestUrl, info, playback = null) {
   const existing = audioCacheInflight.get(info.key);
   if (existing) {
     return existing;
@@ -211,16 +238,27 @@ function downloadAudioToCache(requestUrl, info) {
           }
         },
         (upstreamRes) => {
-          if ((upstreamRes.statusCode || 500) >= 400) {
+          const contentType = String(upstreamRes.headers["content-type"] || "");
+          // Subsonic can return an XML authentication error with HTTP 200.
+          if (upstreamRes.statusCode !== 200 || /(?:xml|json|text\/)/i.test(contentType)) {
             upstreamRes.resume();
-            reject(new Error(`Navidrome stream returned HTTP ${upstreamRes.statusCode}`));
+            reject(new Error(`Navidrome did not return an audio file (HTTP ${upstreamRes.statusCode})`));
             return;
           }
           const writer = createWriteStream(info.tmpPath);
-          upstreamRes.pipe(writer);
-          upstreamRes.on("error", reject);
-          writer.on("error", reject);
-          writer.on("finish", resolve);
+          rememberAudioAuthorization(requestUrl);
+          if (playback && !playback.res.destroyed) {
+            const responseHeaders = { ...upstreamRes.headers, "cache-control": "private, max-age=86400" };
+            delete responseHeaders["content-security-policy"];
+            playback.res.writeHead(200, responseHeaders);
+            upstreamRes.pipe(playback.res);
+            playback.res.once("close", () => {
+              // Finish caching even when the user pauses, seeks or changes songs.
+              upstreamRes.unpipe(playback.res);
+              upstreamRes.resume();
+            });
+          }
+          pipeline(upstreamRes, writer).then(resolve, reject);
         }
       );
       upstreamReq.setTimeout(120000, () => {
@@ -235,6 +273,10 @@ function downloadAudioToCache(requestUrl, info) {
     })
     .catch(async (error) => {
       await unlink(info.tmpPath).catch(() => {});
+      if (playback && !playback.res.destroyed) {
+        if (playback.res.headersSent) playback.res.destroy(error);
+        else writeJson(playback.res, 502, { error: "Unable to stream from Navidrome", details: error.message });
+      }
       throw error;
     })
     .finally(() => {
@@ -277,13 +319,16 @@ async function waitForCachedAudio(info, timeoutMs = audioCacheSeekWaitMs) {
   if (!cachePromise) {
     return null;
   }
+  let timeoutId;
   try {
     await Promise.race([
       cachePromise,
-      new Promise((resolve) => setTimeout(resolve, timeoutMs))
+      new Promise((resolve) => { timeoutId = setTimeout(resolve, timeoutMs); })
     ]);
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeoutId);
   }
   return cachedAudioReady(info);
 }
@@ -347,7 +392,6 @@ function proxyAudioToNavidrome(req, res, requestUrl) {
     (proxyRes) => {
       const responseHeaders = { ...proxyRes.headers };
       delete responseHeaders["content-security-policy"];
-      responseHeaders["accept-ranges"] = responseHeaders["accept-ranges"] || "bytes";
       responseHeaders["cache-control"] = "no-store";
       res.writeHead(proxyRes.statusCode || 502, responseHeaders);
       proxyRes.pipe(res);
@@ -393,18 +437,36 @@ async function serveCachedAudio(req, res, requestUrl) {
   }
   const ready = await cachedAudioReady(info);
   if (ready) {
+    try {
+      await authorizeCachedAudio(requestUrl);
+    } catch {
+      writeJson(res, 401, { error: "Navidrome authentication failed" });
+      return;
+    }
     serveCachedAudioFile(req, res, info, ready.size);
     return;
   }
+  // Tee the initial full playback into the cache, instead of downloading the
+  // same song twice. Range probes still need an independent complete cache fill.
+  if (req.method === "GET" && !req.headers.range && !audioCacheInflight.has(info.key)) {
+    downloadAudioToCache(requestUrl, info, { res }).catch(() => {});
+    return;
+  }
   const cachePromise = downloadAudioToCache(requestUrl, info);
-  if (req.headers.range && requestedRangeStart(req.headers.range) > 0) {
+  cachePromise.catch(() => {});
+  if (info.format !== "raw" && req.headers.range && requestedRangeStart(req.headers.range) > 0) {
     const warmed = await waitForCachedAudio(info);
     if (warmed) {
+      try {
+        await authorizeCachedAudio(requestUrl);
+      } catch {
+        writeJson(res, 401, { error: "Navidrome authentication failed" });
+        return;
+      }
       serveCachedAudioFile(req, res, info, warmed.size);
       return;
     }
   }
-  cachePromise.catch(() => {});
   proxyAudioToNavidrome(req, res, requestUrl);
 }
 
@@ -794,7 +856,7 @@ function proxyToNavidrome(req, res, requestUrl) {
   req.pipe(proxyReq);
 }
 
-createServer(async (req, res) => {
+export const server = createServer(async (req, res) => {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || host}`);
 
   if (requestUrl.pathname.startsWith("/navidrome/")) {
@@ -907,8 +969,12 @@ createServer(async (req, res) => {
   }
 
   serveStatic(req, res, requestUrl);
-}).listen(port, host, () => {
-  console.log(
-    `NaviGlassPlayer running at http://${host}:${port} (default proxy target: ${defaultNavidromeOrigin})`
-  );
 });
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  server.listen(port, host, () => {
+    console.log(
+      `NaviGlassPlayer running at http://${host}:${server.address().port} (default proxy target: ${defaultNavidromeOrigin})`
+    );
+  });
+}
