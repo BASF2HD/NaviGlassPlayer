@@ -26,7 +26,8 @@ import {
     resolveDrawerDisplayNumber,
     stepDrawerSelectionIndex,
 } from "./drawer-navigation.js?v=1";
-import { audioStreamParams, isTimeInRanges, needsSeekRecovery } from "./audio-seek.js?v=1";
+import { audioStreamParams, isTimeInRanges, needsSeekRecovery, streamElapsed, streamDuration, needsServerOffsetSeek } from "./audio-seek.js?v=3";
+import { browserPlaybackProfile, createPlaybackDecisions, decisionStreamParams } from "./navidrome-playback.js?v=2";
 
 const STORAGE_KEY = "naviglassplayer-settings";
 const LEGACY_SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
@@ -267,7 +268,17 @@ let seekPrepareId = 0;
 let seekPointerActive = false;
 let pendingSeek = null;
 const nativeStreamFallbackKeys = new Set();
-let compatibleStreamFallbackKey = "";
+let playbackLoadId = 0;
+let playbackFallback = null;
+let playbackDecision = null;
+let playbackStreamOffset = 0;
+let playbackCompatibility = false;
+let decisionApiUnavailable = false;
+const playbackDecisions = createPlaybackDecisions(
+    fetchPlaybackDecision,
+    browserPlaybackProfile((mime) => elements.audioPlayer.canPlayType(mime), navigator.userAgent),
+    browserPlaybackProfile((mime) => elements.audioPlayer.canPlayType(mime), navigator.userAgent, true)
+);
 let browsePlayRequestId = 0;
 let streamCacheReadyKeys = new Set();
 let streamCacheHandoffDoneKeys = new Set();
@@ -1105,11 +1116,36 @@ function serverStreamParams(track) {
 }
 
 function usesCachedPlaybackRoute(track) {
-    return isServerCachedTrack(track);
+    return isServerCachedTrack(track) && !hasPlaybackDecision(track);
+}
+
+function hasPlaybackDecision(track = state.currentTrack) {
+    return Boolean(playbackDecision && getTrackRecoveryKey(track) === getTrackRecoveryKey());
+}
+
+async function fetchPlaybackDecision(id, profile) {
+    if (decisionApiUnavailable) return null;
+    const response = await fetch(buildProxyUrl("/rest/getTranscodeDecision", { mediaId: id, mediaType: "song" }), {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(profile),
+        signal: AbortSignal.timeout(12000),
+    });
+    if ([404, 405, 501].includes(response.status)) {
+        decisionApiUnavailable = true;
+        return null;
+    }
+    const payload = await response.json();
+    const envelope = payload["subsonic-response"];
+    if (!response.ok || envelope?.status !== "ok") {
+        throw new Error(envelope?.error?.message || "Navidrome could not prepare playback.");
+    }
+    if (!envelope.transcodeDecision) throw new Error("Navidrome returned no playback decision.");
+    return envelope.transcodeDecision;
 }
 
 function warmServerStreamCache(track) {
-    if (!isServerCachedTrack(track)) {
+    if (!usesCachedPlaybackRoute(track)) {
         return;
     }
     fetch(buildServerApiUrl("/api/cache/navidrome/warm-stream", serverStreamParams(track)), {
@@ -1182,7 +1218,7 @@ function cacheReadyPlaybackUrl(track) {
 }
 
 async function switchPhonePlaybackToCachedStream(track, trackKey) {
-    if (streamCacheHandoffInProgress || pendingSeek || seekPointerActive || !isServerCachedTrack(track)) {
+    if (streamCacheHandoffInProgress || pendingSeek || seekPointerActive || !usesCachedPlaybackRoute(track)) {
         return;
     }
     if (streamCacheHandoffDoneKeys.has(trackKey)) {
@@ -1223,7 +1259,7 @@ async function switchPhonePlaybackToCachedStream(track, trackKey) {
 
 function scheduleStreamCacheHandoff(track = state.currentTrack) {
     clearStreamCacheHandoffTimer();
-    if (!isServerCachedTrack(track) || serverStreamParams(track).format === "raw") {
+    if (!usesCachedPlaybackRoute(track) || serverStreamParams(track).format === "raw") {
         return;
     }
     const trackKey = getTrackRecoveryKey(track);
@@ -1270,6 +1306,9 @@ function streamUrl(track) {
 function playbackUrl(track) {
     if (track?.previewUrl || track?.streamUrl) {
         return track.previewUrl || track.streamUrl;
+    }
+    if (hasPlaybackDecision(track)) {
+        return buildProxyUrl("/rest/getTranscodeStream", decisionStreamParams(track.id, playbackDecision, playbackStreamOffset), { expectsJson: false });
     }
     if (!usesCachedPlaybackRoute(track)) {
         return streamUrl(track);
@@ -3226,6 +3265,7 @@ async function ensureDrawerContext() {
         key: entryKey,
         loading: false,
     };
+    playbackDecisions.prefetch(context.items.map(({ track }) => track).filter(isServerCachedTrack).map((track) => track.id));
     renderSongsDrawer();
     return state.drawerContext;
 }
@@ -3239,6 +3279,19 @@ async function connect({ onAuthenticated } = {}) {
         coverTextureCache.clear();
     }
     state.connected = false;
+    playbackLoadId += 1;
+    playbackIntentPlaying = false;
+    elements.audioPlayer.pause();
+    elements.audioPlayer.removeAttribute("src");
+    elements.audioPlayer.load();
+    playbackDecision = null;
+    playbackStreamOffset = 0;
+    playbackFallback = null;
+    seekPrepareId += 1;
+    pendingSeek = null;
+    clearStreamCacheHandoffTimer();
+    playbackDecisions.invalidate();
+    decisionApiUnavailable = false;
     showStatus("Connecting to Navidrome...");
     await fetchJson("/rest/ping.view");
     state.connected = true;
@@ -4755,12 +4808,10 @@ function restoreSearchBaseEntries() {
 
 function getDisplayedTimeline() {
     const audio = elements.audioPlayer;
-    const duration = Number.isFinite(audio.duration) && audio.duration > 0
-        ? audio.duration
-        : playbackState.duration;
+    const duration = getSeekDuration();
     const elapsed = seekPointerActive ? playbackState.elapsed
         : pendingSeek ? pendingSeek.target
-        : Number.isFinite(audio.currentTime) ? audio.currentTime : playbackState.elapsed;
+        : streamElapsed(audio.currentTime, playbackStreamOffset);
     return {
         elapsed: Math.max(0, elapsed || 0),
         duration: Math.max(0, duration || 0),
@@ -7459,6 +7510,14 @@ async function playTrackList(tracks, index, queueKey) {
         return;
     }
 
+    const loadId = ++playbackLoadId;
+    elements.audioPlayer.pause();
+    elements.audioPlayer.removeAttribute("src");
+    elements.audioPlayer.load();
+    playbackDecision = null;
+    playbackStreamOffset = 0;
+    playbackCompatibility = false;
+    playbackFallback = null;
     state.playbackQueue = validTracks;
     state.playbackQueueKey = queueKey || validTracks[0].albumId || validTracks[0].id;
     state.playbackIndex = clamp(index, 0, validTracks.length - 1);
@@ -7476,19 +7535,40 @@ async function playTrackList(tracks, index, queueKey) {
     seekPrepareId += 1;
     pendingSeek = null;
 
-    elements.audioPlayer.preload = "auto";
-    elements.audioPlayer.src = playbackUrl(state.currentTrack);
-    const sourceAtPlay = elements.audioPlayer.src;
-    elements.audioPlayer.load();
-    if (!usesCachedPlaybackRoute(state.currentTrack)) warmServerStreamCache(state.currentTrack);
     playbackIntentPlaying = true;
-    scheduleStreamCacheHandoff(state.currentTrack);
+    playbackState.playing = false;
+    updateUI();
 
+    let sourceAtPlay = "";
     try {
+        if (isServerCachedTrack(state.currentTrack)) {
+            const decision = await playbackDecisions.resolve(state.currentTrack.id);
+            if (loadId !== playbackLoadId) return;
+            playbackDecision = decision;
+        }
+        if (loadId !== playbackLoadId) return;
+        elements.audioPlayer.preload = "auto";
+        elements.audioPlayer.src = playbackUrl(state.currentTrack);
+        sourceAtPlay = elements.audioPlayer.src;
+        elements.audioPlayer.load();
+        scheduleStreamCacheHandoff(state.currentTrack);
+        if (pendingSeek?.trackKey === getTrackRecoveryKey()) {
+            const prepareId = seekPrepareId;
+            await waitForAudioReady(3200);
+            if (loadId !== playbackLoadId) return;
+            if (pendingSeek && prepareId === seekPrepareId) {
+                setAudioCurrentTime(pendingSeek.target);
+                scheduleSeekCommitCheck(pendingSeek.target);
+            }
+        }
+        if (!playbackIntentPlaying) return;
         await elements.audioPlayer.play();
+        if (loadId !== playbackLoadId) return;
+        playbackDecisions.prefetch(validTracks.slice(state.playbackIndex + 1, state.playbackIndex + 4)
+            .filter(isServerCachedTrack).map((track) => track.id));
     } catch (error) {
-        if (elements.audioPlayer.src !== sourceAtPlay) return;
-        if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream()) return;
+        if (loadId !== playbackLoadId || (sourceAtPlay && sourceAtPlay !== elements.audioPlayer.src)) return;
+        if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream(error)) return;
         if (error?.name === "AbortError") {
             // Benign: play() was superseded by a newer pause()/load(), e.g. user clicked another track quickly.
         } else {
@@ -7506,9 +7586,13 @@ async function cmdPlayPause() {
     // what's currently centered in the naviglassplayer. This prevents the button
     // from accidentally starting a new track when the user browsed away.
     if (state.currentTrack && elements.audioPlayer.src) {
+        const loadId = playbackLoadId;
+        const source = elements.audioPlayer.src;
         if (elements.audioPlayer.paused) {
             playbackIntentPlaying = true;
-            await elements.audioPlayer.play().catch((error) => {
+            await elements.audioPlayer.play().catch(async (error) => {
+                if (loadId !== playbackLoadId || source !== elements.audioPlayer.src) return;
+                if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream(error)) return;
                 if (error?.name !== "AbortError") {
                     playbackIntentPlaying = false;
                     reportPlaybackFailure(error);
@@ -7576,7 +7660,7 @@ async function cmdPrev() {
         if (await playAdjacentBrowseEntry(state.currentTrack, -1)) {
             return;
         }
-        elements.audioPlayer.currentTime = 0;
+        await cmdSeek(0);
         updatePlaybackStripUI();
     }
 }
@@ -7594,7 +7678,7 @@ async function cmdNext() {
         playbackIntentPlaying = false;
         clearStreamCacheHandoffTimer();
         elements.audioPlayer.pause();
-        elements.audioPlayer.currentTime = 0;
+        await cmdSeek(0);
         playbackState.playing = false;
         updatePlaybackStripUI();
         updateUI();
@@ -7615,12 +7699,8 @@ function previewSeekFromClientX(clientX) {
 }
 
 function getSeekDuration() {
-    const audioDuration = Number(elements.audioPlayer.duration || 0);
-    if (Number.isFinite(audioDuration) && audioDuration > 0) {
-        return audioDuration;
-    }
-    const knownDuration = Number(playbackState.duration || 0);
-    return Number.isFinite(knownDuration) && knownDuration > 0 ? knownDuration : 0;
+    return streamDuration(elements.audioPlayer.duration,
+        Number(state.currentTrack?.duration || playbackState.duration || 0), playbackStreamOffset);
 }
 
 function didAudioEndEarly() {
@@ -7628,7 +7708,7 @@ function didAudioEndEarly() {
         return false;
     }
     const expectedDuration = Number(state.currentTrack.duration || playbackState.duration || 0);
-    const elapsed = Number(elements.audioPlayer.currentTime || playbackState.elapsed || 0);
+    const elapsed = streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset);
     return expectedDuration > 30 && elapsed > 0 && elapsed < expectedDuration - 8;
 }
 
@@ -7638,6 +7718,13 @@ function getTrackRecoveryKey(track = state.currentTrack) {
 
 function reportPlaybackFailure(error) {
     if (error?.name === "AbortError") return;
+    playbackIntentPlaying = false;
+    playbackState.playing = false;
+    pendingSeek = null;
+    window.clearTimeout(seekRetryTimerId);
+    clearStreamCacheHandoffTimer();
+    elements.audioPlayer.pause();
+    updateUI();
     if (error?.name === "NotAllowedError") {
         flashStatus("Browser playback was blocked.", 2200);
     } else if (error?.name === "NotSupportedError") {
@@ -7650,14 +7737,14 @@ function reportPlaybackFailure(error) {
 
 function setAudioCurrentTime(seconds) {
     if (!Number.isFinite(seconds)) {
-        return elements.audioPlayer.currentTime || 0;
+        return streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset);
     }
     const duration = getSeekDuration();
     const target = duration > 0 ? clamp(seconds, 0, duration) : Math.max(0, seconds);
     try {
-        elements.audioPlayer.currentTime = target;
+        elements.audioPlayer.currentTime = Math.max(0, target - playbackStreamOffset);
     } catch {
-        return elements.audioPlayer.currentTime || 0;
+        return streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset);
     }
     playbackState.elapsed = target;
     playbackState.timelineUpdatedAt = Date.now();
@@ -7697,10 +7784,15 @@ function scheduleSeekCommitCheck(target) {
         if (prepareId !== seekPrepareId || !pendingSeek || getTrackRecoveryKey() !== trackKey) {
             return;
         }
-        if (!needsSeekRecovery(elements.audioPlayer, target)) {
+        if (!needsSeekRecovery(elements.audioPlayer, target - playbackStreamOffset)
+            && (!hasPlaybackDecision() || elements.audioPlayer.readyState >= 3)) {
             pendingSeek = null;
             updatePlaybackStripUI();
             scheduleStreamCacheHandoff();
+            return;
+        }
+        if (hasPlaybackDecision()) {
+            if (!playbackDecision.canDirectPlay) await restartTranscodedAt(target, prepareId);
             return;
         }
         // An original file can fetch the requested range directly; reloading it
@@ -7740,6 +7832,7 @@ function scheduleSeekCommitCheck(target) {
 
 async function recoverInterruptedTrackPlayback() {
     const track = state.currentTrack;
+    const loadId = playbackLoadId;
     if (!track || track.kind === "radio") {
         return false;
     }
@@ -7751,25 +7844,36 @@ async function recoverInterruptedTrackPlayback() {
         streamRecoveryTrackKey = trackKey;
         streamRecoveryAttempts = 0;
     }
-    if (streamRecoveryAttempts >= 2) {
+    if (streamRecoveryAttempts >= (hasPlaybackDecision() ? 1 : 2)) {
         return false;
     }
     streamRecoveryAttempts += 1;
 
     const resumeAt = Math.max(
         0,
-        Number(elements.audioPlayer.currentTime || playbackState.elapsed || 0) + 0.75
+        Number(pendingSeek?.target ?? streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset))
     );
-    elements.audioPlayer.preload = "auto";
-    elements.audioPlayer.src = playbackUrl(track);
-    elements.audioPlayer.load();
-    await waitForAudioReady();
-    setAudioCurrentTime(resumeAt);
     try {
-        await elements.audioPlayer.play();
-        flashStatus("Resuming cached stream...", 1400);
+        if (hasPlaybackDecision()) {
+            playbackDecisions.invalidate(track.id);
+            const decision = await playbackDecisions.resolve(track.id, playbackCompatibility);
+            if (loadId !== playbackLoadId) return true;
+            playbackDecision = decision;
+            playbackStreamOffset = decision?.canTranscode && !decision.canDirectPlay ? Math.floor(resumeAt) : 0;
+        }
+        if (loadId !== playbackLoadId) return true;
+        elements.audioPlayer.preload = "auto";
+        elements.audioPlayer.src = playbackUrl(track);
+        elements.audioPlayer.load();
+        if (resumeAt > 0) {
+            await waitForAudioReady();
+            if (loadId !== playbackLoadId) return true;
+            setAudioCurrentTime(resumeAt);
+        }
+        if (playbackIntentPlaying) await elements.audioPlayer.play();
         return true;
     } catch (error) {
+        if (loadId !== playbackLoadId) return true;
         if (error?.name !== "AbortError") {
             console.error(error);
         }
@@ -7777,34 +7881,82 @@ async function recoverInterruptedTrackPlayback() {
     }
 }
 
-async function fallbackToCompatibleStream() {
+async function fallbackToCompatibleStream(error = elements.audioPlayer.error) {
     const track = state.currentTrack;
     const trackKey = getTrackRecoveryKey(track);
-    if (trackKey && compatibleStreamFallbackKey === trackKey) return true;
-    if (!isServerCachedTrack(track) || serverStreamParams(track).format !== "raw"
-        || ![3, 4].includes(elements.audioPlayer.error?.code)) return false;
-    const prepareId = seekPrepareId;
-    const resumeAt = pendingSeek?.target || elements.audioPlayer.currentTime || 0;
-    compatibleStreamFallbackKey = trackKey;
-    nativeStreamFallbackKeys.add(`${state.settings.serverUrl}|${track.id}`);
+    const loadId = playbackLoadId;
+    if (playbackFallback?.loadId === loadId) return playbackFallback.promise;
+    if (!isServerCachedTrack(track) || playbackCompatibility
+        || !(error?.name === "NotSupportedError" || [3, 4].includes(error?.code))) return false;
+    const resumeAt = pendingSeek?.target ?? streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset);
+    playbackCompatibility = true;
+    const promise = (async () => {
+        try {
+            const decision = await playbackDecisions.resolve(track.id, true);
+            if (loadId !== playbackLoadId || getTrackRecoveryKey() !== trackKey) return true;
+            playbackDecision = decision;
+            playbackStreamOffset = decision?.canTranscode && !decision.canDirectPlay ? Math.floor(resumeAt) : 0;
+            nativeStreamFallbackKeys.add(`${state.settings.serverUrl}|${track.id}`);
+            elements.audioPlayer.src = playbackUrl(track);
+            elements.audioPlayer.load();
+            if (resumeAt > 0) {
+                await waitForAudioReady(3200);
+                if (loadId !== playbackLoadId) return true;
+                setAudioCurrentTime(resumeAt);
+            }
+            if (playbackIntentPlaying) await elements.audioPlayer.play();
+            return true;
+        } catch (fallbackError) {
+            if (loadId === playbackLoadId) reportPlaybackFailure(fallbackError);
+            return true;
+        } finally {
+            if (playbackFallback?.loadId === loadId) playbackFallback = null;
+        }
+    })();
+    playbackFallback = { loadId, promise };
+    return promise;
+}
+
+async function restartTranscodedAt(target, prepareId) {
+    const track = state.currentTrack;
+    const loadId = playbackLoadId;
     try {
+        const decision = await playbackDecisions.resolve(track.id, playbackCompatibility);
+        if (loadId !== playbackLoadId || prepareId !== seekPrepareId) return;
+        if (!decision?.canTranscode || decision.canDirectPlay) return;
+        elements.audioPlayer.pause();
+        playbackDecision = decision;
+        playbackStreamOffset = Math.floor(target);
+        pendingSeek = { target, prepareId, trackKey: getTrackRecoveryKey(track), serverOffset: true };
         elements.audioPlayer.src = playbackUrl(track);
+        const source = elements.audioPlayer.src;
         elements.audioPlayer.load();
-        await waitForAudioReady(3200);
-        if (prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey) return true;
-        if (resumeAt > 0) setAudioCurrentTime(resumeAt);
+        playbackState.elapsed = target;
+        updatePlaybackStripUI();
+        flashStatus("Seeking...", 1400);
+        // Metadata applies the sub-second remainder; do not seek through all
+        // the preceding audio in the newly opened, offset-relative stream.
         if (playbackIntentPlaying) {
-            await elements.audioPlayer.play().catch((error) => {
-                if (prepareId === seekPrepareId && getTrackRecoveryKey() === trackKey && error?.name !== "AbortError") {
-                    playbackIntentPlaying = false;
-                    reportPlaybackFailure(error);
-                }
+            await elements.audioPlayer.play().catch(async (error) => {
+                if (loadId !== playbackLoadId || prepareId !== seekPrepareId || source !== elements.audioPlayer.src) return;
+                if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream(error)) return;
+                reportPlaybackFailure(error);
             });
         }
-    } finally {
-        if (compatibleStreamFallbackKey === trackKey) compatibleStreamFallbackKey = "";
+    } catch (error) {
+        if (loadId === playbackLoadId && prepareId === seekPrepareId) reportPlaybackFailure(error);
     }
-    return true;
+}
+
+function completePendingSeek() {
+    if (!pendingSeek || pendingSeek.serverOffset || elements.audioPlayer.seeking || elements.audioPlayer.readyState < 3
+        || pendingSeek.prepareId !== seekPrepareId || pendingSeek.trackKey !== getTrackRecoveryKey()
+        || Math.abs(streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset) - pendingSeek.target) > 2) return;
+    pendingSeek = null;
+    window.clearTimeout(seekRetryTimerId);
+    playbackState.elapsed = streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset);
+    updatePlaybackStripUI();
+    scheduleStreamCacheHandoff();
 }
 
 async function cmdSeek(seconds) {
@@ -7829,7 +7981,12 @@ async function cmdSeek(seconds) {
     playbackState.timelineUpdatedAt = Date.now();
     updatePlaybackStripUI();
 
-    if (serverStreamParams(trackAtSeek).format !== "raw"
+    if (hasPlaybackDecision() && needsServerOffsetSeek(playbackDecision, elements.audioPlayer, target, playbackStreamOffset)) {
+        await restartTranscodedAt(target, prepareId);
+        return;
+    }
+
+    if (usesCachedPlaybackRoute(trackAtSeek) && serverStreamParams(trackAtSeek).format !== "raw"
         && !isTimeInRanges(elements.audioPlayer.buffered, target)
         && streamCacheReadyKeys.has(serverStreamCacheKey(trackAtSeek))) {
         elements.audioPlayer.src = cacheReadyPlaybackUrl(trackAtSeek);
@@ -7841,8 +7998,10 @@ async function cmdSeek(seconds) {
     setAudioCurrentTime(target);
     scheduleSeekCommitCheck(target);
     if (shouldResume && playbackIntentPlaying) {
-        await elements.audioPlayer.play().catch((error) => {
-            if (prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey) return;
+        const source = elements.audioPlayer.src;
+        await elements.audioPlayer.play().catch(async (error) => {
+            if (prepareId !== seekPrepareId || getTrackRecoveryKey() !== trackKey || source !== elements.audioPlayer.src) return;
+            if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream(error)) return;
             if (error?.name !== "AbortError") {
                 playbackIntentPlaying = false;
                 reportPlaybackFailure(error);
@@ -8698,11 +8857,25 @@ function setupAudio() {
         window.clearTimeout(radioPreviewReconnectTimer);
         radioPreviewReconnectTimer = 0;
         playbackIntentPlaying = true;
+        playbackState.playing = false;
+        playbackState.timelineUpdatedAt = Date.now();
+        updateUI();
+    });
+
+    elements.audioPlayer.addEventListener("playing", () => {
         playbackState.playing = true;
+        completePendingSeek();
         playbackState.timelineUpdatedAt = Date.now();
         updateUI();
         scheduleSnapBackToPlaying();
         scheduleStreamCacheHandoff(state.currentTrack);
+    });
+
+    elements.audioPlayer.addEventListener("waiting", () => {
+        playbackState.elapsed = streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset);
+        playbackState.playing = false;
+        playbackState.timelineUpdatedAt = Date.now();
+        updatePlaybackStripUI();
     });
 
     elements.audioPlayer.addEventListener("pause", () => {
@@ -8713,40 +8886,35 @@ function setupAudio() {
     });
 
     elements.audioPlayer.addEventListener("timeupdate", () => {
+        completePendingSeek();
         if (seekPointerActive || pendingSeek) return;
-        playbackState.elapsed = elements.audioPlayer.currentTime || 0;
+        playbackState.elapsed = streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset);
         playbackState.timelineUpdatedAt = Date.now();
         updatePlaybackStripUI();
     });
 
     elements.audioPlayer.addEventListener("seeked", () => {
-        if (pendingSeek && pendingSeek.prepareId === seekPrepareId
-            && pendingSeek.trackKey === getTrackRecoveryKey()
-            && Math.abs(elements.audioPlayer.currentTime - pendingSeek.target) < 1) {
-            pendingSeek = null;
-            window.clearTimeout(seekRetryTimerId);
-            playbackState.elapsed = elements.audioPlayer.currentTime;
-            updatePlaybackStripUI();
-            scheduleStreamCacheHandoff();
-        }
+        completePendingSeek();
     });
 
     elements.audioPlayer.addEventListener("loadedmetadata", () => {
-        playbackState.duration = Number.isFinite(elements.audioPlayer.duration)
-            ? elements.audioPlayer.duration
-            : playbackState.duration;
+        playbackState.duration = getSeekDuration();
+        if (pendingSeek?.serverOffset && pendingSeek.prepareId === seekPrepareId
+            && pendingSeek.trackKey === getTrackRecoveryKey()) {
+            pendingSeek.serverOffset = false;
+            setAudioCurrentTime(pendingSeek.target);
+        }
         updatePlaybackStripUI();
         positionInfoPanel();
     });
 
     elements.audioPlayer.addEventListener("durationchange", () => {
-        playbackState.duration = Number.isFinite(elements.audioPlayer.duration)
-            ? elements.audioPlayer.duration
-            : playbackState.duration;
+        playbackState.duration = getSeekDuration();
         updatePlaybackStripUI();
     });
 
     elements.audioPlayer.addEventListener("ended", async () => {
+        const loadId = playbackLoadId;
         if (scheduleRadioPreviewReconnect()) {
             return;
         }
@@ -8754,6 +8922,7 @@ function setupAudio() {
             if (await recoverInterruptedTrackPlayback()) {
                 return;
             }
+            if (loadId !== playbackLoadId) return;
             playbackIntentPlaying = false;
             playbackState.playing = false;
             updatePlaybackStripUI();
@@ -8764,15 +8933,22 @@ function setupAudio() {
     });
 
     elements.audioPlayer.addEventListener("error", async () => {
-        if (await fallbackToCompatibleStream()) return;
+        const error = elements.audioPlayer.error;
+        const loadId = playbackLoadId;
+        if (!error) return;
+        playbackState.playing = false;
+        updatePlaybackStripUI();
+        if (await fallbackToCompatibleStream(error)) return;
+        if (loadId !== playbackLoadId) return;
         if (scheduleRadioPreviewReconnect()) {
             return;
         }
-        if (await recoverInterruptedTrackPlayback()) {
+        if (error.code === 2 && await recoverInterruptedTrackPlayback()) {
             return;
         }
-        playbackIntentPlaying = false;
-        flashStatus("Could not stream the selected track.", 2400);
+        if (loadId !== playbackLoadId) return;
+        reportPlaybackFailure(new DOMException(error.message || "Could not stream the selected track.",
+            [3, 4].includes(error.code) ? "NotSupportedError" : "NetworkError"));
     });
 }
 
@@ -9474,11 +9650,11 @@ function setupInput() {
         if (event.key === "ArrowLeft") {
             event.preventDefault();
             event.stopPropagation();
-            await cmdSeek((elements.audioPlayer.currentTime || 0) - 5);
+            await cmdSeek(streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset) - 5);
         } else if (event.key === "ArrowRight") {
             event.preventDefault();
             event.stopPropagation();
-            await cmdSeek((elements.audioPlayer.currentTime || 0) + 5);
+            await cmdSeek(streamElapsed(elements.audioPlayer.currentTime, playbackStreamOffset) + 5);
         }
     });
 

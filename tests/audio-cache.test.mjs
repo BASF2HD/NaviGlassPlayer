@@ -1,7 +1,7 @@
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -14,6 +14,33 @@ let finishSlowStream;
 before(async () => {
     upstream = createServer((req, res) => {
         const url = new URL(req.url, "http://localhost");
+        if (url.pathname === "/rest/getTranscodeDecision") {
+            assert.equal(req.method, "POST");
+            let body = "";
+            req.on("data", (chunk) => { body += chunk; });
+            req.on("end", () => {
+                assert.equal(JSON.parse(body).name, "NaviGlassPlayer");
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ "subsonic-response": { status: "ok", transcodeDecision: { canDirectPlay: true, transcodeParams: "signed-token" } } }));
+            });
+            return;
+        }
+        if (url.pathname === "/rest/getTranscodeStream") {
+            if (url.searchParams.get("transcodeParams") === "expired") {
+                res.writeHead(410); res.end(); return;
+            }
+            if (url.searchParams.has("offset")) {
+                assert.equal(url.searchParams.get("offset"), "172");
+                assert.equal(req.headers.range, undefined);
+                res.writeHead(200, { "content-type": "audio/flac", "accept-ranges": "none" });
+                res.end(audio.subarray(0, 100));
+                return;
+            }
+            assert.equal(req.headers.range, "bytes=100-199");
+            res.writeHead(206, { "content-type": "audio/flac", "accept-ranges": "bytes", "content-length": 100, "content-range": "bytes 100-199/4096" });
+            res.end(audio.subarray(100, 200));
+            return;
+        }
         if (url.pathname === "/rest/ping.view") {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ "subsonic-response": { status: url.searchParams.get("p") === "test-password" ? "ok" : "failed" } }));
@@ -147,4 +174,26 @@ test("a cached song cannot be retrieved with missing or incorrect credentials", 
         assert.equal(response.status, 401);
         await response.json();
     }
+});
+
+test("decision POSTs and signed byte-range streams pass through without a second audio cache", async () => {
+    const filesBefore = await readdir(cacheDir);
+    const response = await fetch(`${origin}/navidrome/rest/getTranscodeDecision?mediaId=song&f=json`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "NaviGlassPlayer" }),
+    });
+    assert.equal((await response.json())["subsonic-response"].transcodeDecision.canDirectPlay, true);
+    const stream = await fetch(`${origin}/navidrome/rest/getTranscodeStream?mediaId=song&transcodeParams=signed-token`, { headers: { range: "bytes=100-199" } });
+    assert.equal(stream.status, 206);
+    assert.equal(stream.headers.get("content-type"), "audio/flac");
+    assert.equal(stream.headers.get("content-range"), "bytes 100-199/4096");
+    assert.deepEqual(Buffer.from(await stream.arrayBuffer()), audio.subarray(100, 200));
+    const offset = await fetch(`${origin}/navidrome/rest/getTranscodeStream?mediaId=song&transcodeParams=signed-token&offset=172`);
+    assert.equal(offset.status, 200);
+    assert.equal(offset.headers.get("content-type"), "audio/flac");
+    assert.equal(offset.headers.get("accept-ranges"), "none");
+    assert.equal((await offset.arrayBuffer()).byteLength, 100);
+    assert.deepEqual(await readdir(cacheDir), filesBefore);
+    const expired = await fetch(`${origin}/navidrome/rest/getTranscodeStream?transcodeParams=expired`);
+    assert.equal(expired.status, 410);
+    await expired.arrayBuffer();
 });

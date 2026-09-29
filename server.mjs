@@ -831,7 +831,8 @@ function proxyToNavidrome(req, res, requestUrl) {
     }
   );
 
-  proxyReq.setTimeout(navidromeProxyTimeoutMs, () => {
+  const audioStream = /^\/rest\/(getTranscodeStream|stream)(\.view)?$/.test(requestPath);
+  proxyReq.setTimeout(audioStream ? Math.max(navidromeProxyTimeoutMs, 120000) : navidromeProxyTimeoutMs, () => {
     proxyReq.destroy(new Error("Navidrome request timed out"));
   });
 

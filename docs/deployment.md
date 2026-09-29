@@ -1,5 +1,18 @@
 # Deployment
 
+## Update Workflow
+
+For VM and production updates, run the tests, commit the changes, and push the
+commit to GitHub first. Verify the exact commit is present on the remote branch
+before deploying its runtime files. Do not deploy uncommitted changes or proceed
+when the push fails. Local testing can take place before committing.
+
+Back up the existing deployment before updating it, preserve unrelated server
+configuration and files, and verify file hashes and service health afterward.
+Player-only updates must not modify Navidrome or the music library.
+
+## Installation
+
 This repo ships two one-shot deployment helpers for clean Linux servers:
 
 - [scripts/deploy-rocky.sh](../scripts/deploy-rocky.sh)
