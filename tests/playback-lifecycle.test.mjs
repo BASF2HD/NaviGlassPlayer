@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { isTimeInRanges, needsServerOffsetSeek, streamElapsed, streamDuration } from "../public/audio-seek.js";
+import { buildPlaybackOrder, playbackStep, samePlaybackQueue } from "../public/playback-order.js";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
@@ -27,7 +28,11 @@ function fixture() {
     const context = {
         Date, Number, Boolean, Math, DOMException,
         console: { error() {} }, window: { clearTimeout() {} },
-        elements: { audioPlayer: audio }, state: { currentTrack: null },
+        elements: { audioPlayer: audio }, state: {
+            currentTrack: null, playbackQueue: [], playbackOrder: [],
+            settings: { shuffle: false, repeatMode: "off" },
+        },
+        buildPlaybackOrder, playbackStep, samePlaybackQueue,
         playbackState: {}, playbackLoadId: 0, playbackIntentPlaying: false,
         playbackDecision: null, playbackCompatibility: false, playbackFallback: null,
         playbackStreamOffset: 0, streamElapsed, streamDuration, needsServerOffsetSeek, isTimeInRanges,
@@ -107,6 +112,47 @@ test("rapid song switching discards the previous song's late stream decision", a
     assert.equal(audio.src, "/stream/second");
     assert.equal(context.state.currentTrack.id, "second");
     assert.equal(audio.paused, false);
+});
+
+test("shuffle order survives track changes and prefetch follows that order", async () => {
+    const { context } = fixture();
+    const queue = [{ id: "first" }, { id: "second" }, { id: "third" }];
+    context.state.playbackQueue = queue;
+    context.state.playbackQueueKey = "queue";
+    context.state.playbackOrder = [2, 0, 1];
+    context.state.settings.shuffle = true;
+    let prefetched = [];
+    context.playbackDecisions.prefetch = (ids) => { prefetched = [...ids]; };
+    await context.playTrackList(queue, 2, "queue");
+    assert.deepEqual(context.state.playbackOrder, [2, 0, 1]);
+    assert.deepEqual(prefetched, ["first", "second"]);
+    await context.playTrackList(queue.map((track) => ({ ...track })), 0, "queue");
+    assert.deepEqual(context.state.playbackOrder, [2, 0, 1]);
+    assert.deepEqual(prefetched, ["second"]);
+});
+
+test("a different queue rebuilds shuffle around its explicitly selected song", async () => {
+    const { context } = fixture();
+    context.state.settings.shuffle = true;
+    await context.playTrackList([{ id: "first" }, { id: "second" }, { id: "third" }], 1, "new-album");
+    assert.equal(context.state.playbackOrder[0], 1);
+    assert.equal(context.state.currentTrack.id, "second");
+    assert.equal(new Set(context.state.playbackOrder).size, 3);
+});
+
+test("prefetch wraps with repeat all without revisiting prepared songs", async () => {
+    const { context } = fixture();
+    context.state.playbackQueue = [{ id: "first" }, { id: "second" }, { id: "third" }];
+    context.state.playbackOrder = [0, 1, 2];
+    context.state.playbackIndex = 2;
+    context.state.settings.repeatMode = "all";
+    let prefetched = [];
+    context.playbackDecisions.prefetch = (ids) => { prefetched = [...ids]; };
+    context.prefetchUpcomingPlaybackTracks();
+    assert.deepEqual(prefetched, ["first", "second"]);
+    context.state.settings.repeatMode = "song";
+    context.prefetchUpcomingPlaybackTracks();
+    assert.deepEqual(prefetched, []);
 });
 
 function liveConversion() {

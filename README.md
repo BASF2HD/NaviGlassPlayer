@@ -33,6 +33,7 @@ https://basf2hd.github.io/NaviGlassPlayer/
 - Browser IndexedDB caching plus server-side album and stream caches
 - Album song drawer, track information, ratings, favourites, search, seeking, and playback controls
 - Navidrome playlists and internet radio browsing
+- Repeat All, Repeat Song, Repeat Off, and shuffle controls beside the song seek bar
 - CSV export for favourite songs, favourite albums, and selected playlists
 - Local Node proxy so Navidrome credentials and media stay on the configured server path
 
@@ -43,6 +44,8 @@ With Navidrome 0.62.0 or newer, playback uses the same codec-specific browser pr
 Decisions for the next three songs are prefetched and cached until their signed stream tokens approach expiry. Playback uses Navidrome's progressive streaming and transcode cache, without NaviGlassPlayer's extra mid-song cache handoff. Native files and seekable cached conversions use browser seeking. For unbuffered, non-seekable conversions, NaviGlassPlayer requests Navidrome's time-offset stream, starting conversion at the requested position rather than waiting for all preceding audio. The displayed position and duration remain relative to the full song. Network speed and browser decoding still affect startup and seeking. Older servers retain the legacy progressive cache route, conservatively converting MP4 containers whose codec support cannot be established. Original library files are never modified.
 
 Press Down to open the song drawer, then Up or Down to select a song and Enter to play it. Space toggles playback with the drawer open or closed. With the drawer closed, Enter plays the centered album's first song or the centered song. Drawer numbers use album track metadata when available, or the visible row number when it is missing; playlists use their row order.
+
+The repeat button to the left of the timer cycles **Repeat Off → Repeat All → Repeat Song**. Repeat All loops the current playback queue (album, playlist, or song list); Repeat Song restarts the current track when it finishes, while manual Next still skips it. Shuffle, to the right of the seek bar, keeps the current song playing and randomizes the remaining queue without changing library or playlist order. Turning shuffle off restores normal order. These preferences are saved in this browser. Radio streams retain their existing reconnect behavior. The volume popup also works in fullscreen.
 
 ## Export Music Lists
 

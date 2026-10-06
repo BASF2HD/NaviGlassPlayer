@@ -1316,7 +1316,7 @@ body.is-player-fullscreen #controls,
     width: var(--top-playback-width);
     max-width: calc(100% - 20px);
     display: grid;
-    grid-template-columns: minmax(0, max-content) minmax(42px, 1fr) auto auto;
+    grid-template-columns: auto minmax(0, max-content) minmax(42px, 1fr) auto auto auto;
     align-items: center;
     gap: var(--playback-strip-gap);
     min-width: 0;
@@ -1401,6 +1401,7 @@ body.is-player-fullscreen #controls,
 
 #btn-volume,
 #btn-search,
+.top-playback-mode-button,
 #btn-player-fullscreen {
     align-items: center;
     appearance: none;
@@ -1410,6 +1411,7 @@ body.is-player-fullscreen #controls,
     color: rgba(255, 255, 255, 0.9);
     cursor: pointer;
     display: flex;
+    flex-shrink: 0;
     height: var(--top-volume-button-size);
     justify-content: center;
     padding: 0;
@@ -1419,10 +1421,26 @@ body.is-player-fullscreen #controls,
 
 #btn-volume svg,
 #btn-search svg,
+.top-playback-mode-button svg,
 #btn-player-fullscreen svg {
     display: block;
     height: var(--top-volume-icon-size);
     width: var(--top-volume-icon-size);
+}
+
+.top-playback-mode-button {
+    color: rgba(255, 255, 255, 0.65);
+}
+
+.top-playback-mode-button.is-active {
+    color: #fff;
+    background: rgba(255, 255, 255, 0.18);
+    border-color: rgba(255, 255, 255, 0.65);
+}
+
+.top-playback-mode-button:focus-visible {
+    outline: 2px solid #fff;
+    outline-offset: 2px;
 }
 
 #btn-volume.is-muted,
@@ -2908,7 +2926,7 @@ body.is-player-fullscreen .player-fullscreen-button,
     #playback-strip {
         position: absolute;
         z-index: 122;
-        grid-template-columns: minmax(0, max-content) minmax(32px, 1fr) auto auto;
+        grid-template-columns: auto minmax(0, max-content) minmax(32px, 1fr) auto auto auto;
         padding: 0 2px;
         max-width: calc(100% - 16px);
     }

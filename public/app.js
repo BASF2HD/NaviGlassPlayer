@@ -28,6 +28,7 @@ import {
 } from "./drawer-navigation.js?v=1";
 import { audioStreamParams, isTimeInRanges, needsSeekRecovery, streamElapsed, streamDuration, needsServerOffsetSeek } from "./audio-seek.js?v=3";
 import { browserPlaybackProfile, createPlaybackDecisions, decisionStreamParams } from "./navidrome-playback.js?v=2";
+import { normalizeRepeatMode, nextRepeatMode, buildPlaybackOrder, playbackStep, samePlaybackQueue } from "./playback-order.js?v=1";
 
 const STORAGE_KEY = "naviglassplayer-settings";
 const LEGACY_SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
@@ -121,6 +122,8 @@ const defaultSettings = {
     playlistBrowseSort: DEFAULT_BROWSE_SORT,
     playlistDisplayMode: TRACK_DISPLAY_MODE.ALBUM,
     sortDefaultsVersion: SORT_DEFAULTS_VERSION,
+    repeatMode: "off",
+    shuffle: false,
 };
 
 const HEART_ICON_OUTLINE_PATH =
@@ -173,6 +176,9 @@ const elements = {
     seekTrack: document.getElementById("seek-track"),
     seekFill: document.getElementById("seek-fill"),
     seekHandle: document.getElementById("seek-handle"),
+    btnRepeat: document.getElementById("btn-repeat"),
+    repeatSongMark: document.getElementById("repeat-song-mark"),
+    btnShuffle: document.getElementById("btn-shuffle"),
     btnSearch: document.getElementById("btn-search"),
     btnPlayerFullscreen: document.getElementById("btn-player-fullscreen"),
     searchPanel: document.getElementById("search-panel"),
@@ -346,6 +352,7 @@ const state = {
     genreOptions: [],
     detailsCache: new Map(),
     playbackQueue: [],
+    playbackOrder: [],
     playbackQueueKey: "",
     playbackIndex: -1,
     currentTrack: null,
@@ -371,6 +378,7 @@ setupAudio();
 setupInput();
 portalBrowseDropdowns();
 updatePlaybackStripUI();
+updatePlaybackModeControls();
 updateBrowseStripUI();
 renderBrowseMenus();
 renderSongsDrawer();
@@ -510,6 +518,8 @@ function loadSettings() {
             playlistBrowseSort: savedSortOrDefault(stored.playlistBrowseSort),
             playlistDisplayMode: normalizeTrackDisplayMode(stored.playlistDisplayMode || defaultSettings.playlistDisplayMode),
             sortDefaultsVersion: SORT_DEFAULTS_VERSION,
+            repeatMode: normalizeRepeatMode(stored.repeatMode),
+            shuffle: stored.shuffle === true,
         };
     } catch {
         return { ...defaultSettings };
@@ -543,6 +553,8 @@ function saveSettings() {
     state.settings.artistBrowseSort = normalizeBrowseSort(state.settings.artistBrowseSort);
     state.settings.artistDisplayMode = normalizeTrackDisplayMode(state.settings.artistDisplayMode);
     state.settings.sortDefaultsVersion = SORT_DEFAULTS_VERSION;
+    state.settings.repeatMode = normalizeRepeatMode(state.settings.repeatMode);
+    state.settings.shuffle = state.settings.shuffle === true;
     const persistedSettings = { ...state.settings };
     window.sessionStorage.removeItem(LEGACY_SESSION_PASSWORD_KEY);
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSettings));
@@ -4393,10 +4405,7 @@ function portalBrowseDropdowns() {
             el.classList.add("browse-dropdown-floating");
         }
     }
-    if (elements.volumePopover && elements.volumePopover.parentElement !== document.body) {
-        document.body.appendChild(elements.volumePopover);
-        elements.volumePopover.classList.add("volume-popover-floating");
-    }
+    syncVolumePopoverHost();
     let floatingPositionTimer = 0;
     const scheduleFloatingPosition = () => {
         if (floatingPositionTimer) {
@@ -4899,10 +4908,11 @@ function updatePlaybackSummary() {
     elements.iconFsPlay.classList.toggle("hidden", playbackState.playing);
     elements.iconFsPause.classList.toggle("hidden", !playbackState.playing);
     const hasQueue = state.playbackQueue.length > 0;
-    const canPrevWithinQueue = hasQueue && state.playbackIndex > 0;
-    const canNextWithinQueue = hasQueue && state.playbackIndex < state.playbackQueue.length - 1;
-    elements.btnPrev.disabled = !hasQueue || (!canPrevWithinQueue && !hasAdjacentBrowseEntry(state.currentTrack, -1));
-    elements.btnNext.disabled = !hasQueue || (!canNextWithinQueue && !hasAdjacentBrowseEntry(state.currentTrack, 1));
+    const canPrevWithinQueue = playbackStep(state.playbackOrder, state.playbackIndex, -1, state.settings.repeatMode) !== null;
+    const canNextWithinQueue = playbackStep(state.playbackOrder, state.playbackIndex, 1, state.settings.repeatMode) !== null;
+    const canBrowseAdjacent = !state.settings.shuffle && state.settings.repeatMode !== "all";
+    elements.btnPrev.disabled = !hasQueue || (!canPrevWithinQueue && !(canBrowseAdjacent && hasAdjacentBrowseEntry(state.currentTrack, -1)));
+    elements.btnNext.disabled = !hasQueue || (!canNextWithinQueue && !(canBrowseAdjacent && hasAdjacentBrowseEntry(state.currentTrack, 1)));
     elements.btnFsPrev.disabled = elements.btnPrev.disabled;
     elements.btnFsNext.disabled = elements.btnNext.disabled;
     updatePlaybackStripUI();
@@ -5324,12 +5334,23 @@ function flashStatus(message, duration = 1800) {
 }
 
 function setVolumePopoverOpen(open) {
+    syncVolumePopoverHost();
     elements.volumePopover.classList.toggle("is-open", open);
     elements.volumePopover.setAttribute("aria-hidden", String(!open));
     elements.btnVolume.setAttribute("aria-expanded", String(open));
     if (open) {
         positionVolumePopover();
     }
+}
+
+function syncVolumePopoverHost() {
+    // A body portal is outside #app's native fullscreen top layer and becomes invisible.
+    const host = getFullscreenElement() || (state.playerFullscreen ? elements.app : document.body);
+    if (elements.volumePopover.parentElement !== host) {
+        host.appendChild(elements.volumePopover);
+    }
+    elements.volumePopover.classList.add("volume-popover-floating");
+    if (elements.volumePopover.classList.contains("is-open")) positionVolumePopover();
 }
 
 function getFullscreenElement() {
@@ -5373,6 +5394,7 @@ function exitAppFullscreen() {
 
 function syncPlayerFullscreenState() {
     const active = Boolean(getFullscreenElement()) || state.playerFullscreen;
+    syncVolumePopoverHost();
     document.documentElement.classList.toggle("is-player-fullscreen", active);
     document.body.classList.toggle("is-player-fullscreen", active);
     elements.btnPlayerFullscreen.classList.toggle("is-active", active);
@@ -7518,9 +7540,15 @@ async function playTrackList(tracks, index, queueKey) {
     playbackStreamOffset = 0;
     playbackCompatibility = false;
     playbackFallback = null;
+    const nextQueueKey = queueKey || validTracks[0].albumId || validTracks[0].id;
+    const nextIndex = clamp(index, 0, validTracks.length - 1);
+    if (state.playbackQueueKey !== nextQueueKey || !samePlaybackQueue(state.playbackQueue, validTracks)
+        || state.playbackOrder.length !== validTracks.length) {
+        state.playbackOrder = buildPlaybackOrder(validTracks.length, nextIndex, state.settings.shuffle);
+    }
     state.playbackQueue = validTracks;
-    state.playbackQueueKey = queueKey || validTracks[0].albumId || validTracks[0].id;
-    state.playbackIndex = clamp(index, 0, validTracks.length - 1);
+    state.playbackQueueKey = nextQueueKey;
+    state.playbackIndex = nextIndex;
     state.currentTrack = validTracks[state.playbackIndex];
     state.currentAlbumId = state.currentTrack.albumId || "";
     updateNowPlayingMeta(state.currentTrack);
@@ -7564,8 +7592,7 @@ async function playTrackList(tracks, index, queueKey) {
         if (!playbackIntentPlaying) return;
         await elements.audioPlayer.play();
         if (loadId !== playbackLoadId) return;
-        playbackDecisions.prefetch(validTracks.slice(state.playbackIndex + 1, state.playbackIndex + 4)
-            .filter(isServerCachedTrack).map((track) => track.id));
+        prefetchUpcomingPlaybackTracks();
     } catch (error) {
         if (loadId !== playbackLoadId || (sourceAtPlay && sourceAtPlay !== elements.audioPlayer.src)) return;
         if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream(error)) return;
@@ -7579,6 +7606,20 @@ async function playTrackList(tracks, index, queueKey) {
 
     syncBrowseToTrack(state.currentTrack);
     updateUI();
+}
+
+function prefetchUpcomingPlaybackTracks() {
+    const upcoming = [];
+    const visited = new Set([state.playbackIndex]);
+    let index = state.playbackIndex;
+    for (let count = 0; count < 3; count += 1) {
+        index = playbackStep(state.playbackOrder, index, 1, state.settings.repeatMode, true);
+        if (index === null || visited.has(index)) break;
+        visited.add(index);
+        const track = state.playbackQueue[index];
+        if (isServerCachedTrack(track)) upcoming.push(track.id);
+    }
+    playbackDecisions.prefetch(upcoming);
 }
 
 async function cmdPlayPause() {
@@ -7650,14 +7691,47 @@ function isEntryCurrentlyPlaying(entry) {
     return entry.id === state.currentTrack.id;
 }
 
+function updatePlaybackModeControls() {
+    const repeatMode = state.settings.repeatMode;
+    const repeatLabel = `Repeat ${repeatMode === "song" ? "Song" : repeatMode === "all" ? "All" : "Off"}`;
+    elements.btnRepeat.title = repeatLabel;
+    elements.btnRepeat.setAttribute("aria-label", repeatLabel);
+    elements.btnRepeat.setAttribute("aria-pressed", String(repeatMode !== "off"));
+    elements.btnRepeat.classList.toggle("is-active", repeatMode !== "off");
+    elements.repeatSongMark.classList.toggle("hidden", repeatMode !== "song");
+    const shuffleLabel = `Shuffle ${state.settings.shuffle ? "On" : "Off"}`;
+    elements.btnShuffle.title = shuffleLabel;
+    elements.btnShuffle.setAttribute("aria-label", shuffleLabel);
+    elements.btnShuffle.setAttribute("aria-pressed", String(state.settings.shuffle));
+    elements.btnShuffle.classList.toggle("is-active", state.settings.shuffle);
+}
+
+function cycleRepeatMode() {
+    state.settings.repeatMode = nextRepeatMode(state.settings.repeatMode);
+    saveSettings();
+    updatePlaybackModeControls();
+    updatePlaybackSummary();
+    prefetchUpcomingPlaybackTracks();
+}
+
+function toggleShuffleMode() {
+    state.settings.shuffle = !state.settings.shuffle;
+    state.playbackOrder = buildPlaybackOrder(state.playbackQueue.length, state.playbackIndex, state.settings.shuffle);
+    saveSettings();
+    updatePlaybackModeControls();
+    updatePlaybackSummary();
+    prefetchUpcomingPlaybackTracks();
+}
+
 async function cmdPrev() {
     if (state.playbackQueue.length === 0) {
         return;
     }
-    if (state.playbackIndex > 0) {
-        await playTrackList(state.playbackQueue, state.playbackIndex - 1, state.playbackQueueKey);
+    const previousIndex = playbackStep(state.playbackOrder, state.playbackIndex, -1, state.settings.repeatMode);
+    if (previousIndex !== null) {
+        await playTrackList(state.playbackQueue, previousIndex, state.playbackQueueKey);
     } else {
-        if (await playAdjacentBrowseEntry(state.currentTrack, -1)) {
+        if (!state.settings.shuffle && await playAdjacentBrowseEntry(state.currentTrack, -1)) {
             return;
         }
         await cmdSeek(0);
@@ -7665,14 +7739,15 @@ async function cmdPrev() {
     }
 }
 
-async function cmdNext() {
+async function cmdNext({ automatic = false } = {}) {
     if (state.playbackQueue.length === 0) {
         return;
     }
-    if (state.playbackIndex < state.playbackQueue.length - 1) {
-        await playTrackList(state.playbackQueue, state.playbackIndex + 1, state.playbackQueueKey);
+    const nextIndex = playbackStep(state.playbackOrder, state.playbackIndex, 1, state.settings.repeatMode, automatic);
+    if (nextIndex !== null) {
+        await playTrackList(state.playbackQueue, nextIndex, state.playbackQueueKey);
     } else {
-        if (await playAdjacentBrowseEntry(state.currentTrack, 1)) {
+        if (!state.settings.shuffle && await playAdjacentBrowseEntry(state.currentTrack, 1)) {
             return;
         }
         playbackIntentPlaying = false;
@@ -8929,7 +9004,7 @@ function setupAudio() {
             flashStatus("Stream ended early. Press play to resume this track.", 2400);
             return;
         }
-        cmdNext();
+        await cmdNext({ automatic: true });
     });
 
     elements.audioPlayer.addEventListener("error", async () => {
@@ -9133,6 +9208,14 @@ function setupInput() {
     elements.btnVolume.addEventListener("click", (event) => {
         event.stopPropagation();
         setVolumePopoverOpen(!elements.volumePopover.classList.contains("is-open"));
+    });
+    elements.btnRepeat.addEventListener("click", (event) => {
+        event.stopPropagation();
+        cycleRepeatMode();
+    });
+    elements.btnShuffle.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleShuffleMode();
     });
     elements.volumeSlider.addEventListener("input", syncVolumeFromSlider);
     elements.browseAlbum.addEventListener("click", async (event) => {
@@ -10047,6 +10130,9 @@ function setupInput() {
         }
 
         if (isTextEntryTarget(event.target)) {
+            return;
+        }
+        if (event.target.closest?.("#btn-repeat, #btn-shuffle")) {
             return;
         }
         if (!elements.connectModal.classList.contains("hidden")
