@@ -52,7 +52,7 @@ function fixture() {
         clamp: (value, min, max) => Math.min(max, Math.max(min, value)),
         updateNowPlayingMeta() {}, syncBrowseToTrack() {},
         playbackUrl: (track) => `/stream/${track.id}${context.playbackStreamOffset ? `?offset=${context.playbackStreamOffset}` : ""}`,
-        playbackDecisions: { resolve: async () => ({ canDirectPlay: true }), prefetch() {} },
+        playbackDecisions: { peek: () => null, resolve: async () => ({ canDirectPlay: true }), prefetch() {} },
     };
     runInNewContext(`${failure}\n${setTime}\n${earlyEnd}\n${seekCommands}\n${audioSetup}\n${playList}\nsetupAudio();`, context);
     return { audio, context, emit: (name) => listeners.get(name)() };
@@ -112,6 +112,33 @@ test("rapid song switching discards the previous song's late stream decision", a
     assert.equal(audio.src, "/stream/second");
     assert.equal(context.state.currentTrack.id, "second");
     assert.equal(audio.paused, false);
+});
+
+test("a prepared song starts audio in the click stack without awaiting another decision", async () => {
+    const { audio, context } = fixture();
+    context.playbackDecisions.peek = () => ({ canDirectPlay: true });
+    context.playbackDecisions.resolve = () => assert.fail("cached decision must be reused");
+    const changes = [];
+    context.updateUI = (options) => changes.push(options);
+    const playback = context.playTrackList([{ id: "prepared" }], 0, "queue");
+    assert.equal(audio.playCalls, 1);
+    assert.equal(audio.src, "/stream/prepared");
+    await playback;
+    assert.ok(changes.every((options) => options.playbackOnly), "playback must not rebuild the drawer");
+});
+
+test("upcoming decisions prepare while the current song buffers, not after it starts", async () => {
+    const { audio, context } = fixture();
+    context.playbackDecisions.peek = () => ({ canDirectPlay: true });
+    let finishPlaying;
+    audio.play = () => new Promise((resolve) => { finishPlaying = resolve; });
+    let prefetched;
+    context.playbackDecisions.prefetch = (ids) => { prefetched = [...ids]; };
+    const playback = context.playTrackList([{ id: "first" }, { id: "second" }], 0, "queue");
+    assert.deepEqual(prefetched, ["second"]);
+    assert.equal(context.playbackState.playing, false);
+    finishPlaying();
+    await playback;
 });
 
 test("shuffle order survives track changes and prefetch follows that order", async () => {

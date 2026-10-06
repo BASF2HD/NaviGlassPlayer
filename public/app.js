@@ -5452,9 +5452,13 @@ function togglePlayerFullscreen() {
     setPlayerFullscreen(!state.playerFullscreen && !getFullscreenElement());
 }
 
-function updateUI() {
+function updateUI({ playbackOnly = false } = {}) {
     updateBrowseSummary();
     updatePlaybackSummary();
+    if (playbackOnly) {
+        updateSongsDrawerPlaybackState();
+        return;
+    }
     renderBrowseMenus();
     renderSongsDrawer();
 }
@@ -5907,8 +5911,7 @@ function positionInfoPanel() {
         coverHeightPx = Math.max(0, Math.round(coverBounds.height));
         fitPlaybackStripLayout(coverWidthPx, coverHeightPx);
 
-        const playbackInsetX = clamp(Math.round(coverWidthPx * 0.04), 8, 18);
-        const playbackWidthPx = Math.max(0, coverWidthPx - playbackInsetX * 2);
+        const playbackWidthPx = coverWidthPx;
         elements.playbackStrip.style.left = `${Math.round(coverBounds.centerX)}px`;
         elements.playbackStrip.style.width = `${playbackWidthPx}px`;
         elements.playbackStrip.style.maxWidth = `${playbackWidthPx}px`;
@@ -6132,6 +6135,51 @@ function moveDrawerSelection(delta) {
         state.drawerContext.items?.length || 0
     );
     if (nextIndex >= 0) setDrawerSelectionIndex(nextIndex);
+}
+
+function updateSongsDrawerPlaybackState() {
+    const context = state.drawerContext;
+    if (!context.items?.length || context.loading) return;
+    const oldRows = elements.songsTableBody.querySelectorAll("tr.is-current, tr.is-keyboard-selected");
+    const currentIndexes = new Set();
+    context.items.forEach(({ track }, index) => {
+        if (track?.id && track.id === state.currentTrack?.id) currentIndexes.add(index);
+    });
+    const selectionIndex = state.drawerOpen ? ensureDrawerSelectionIndex(context.items) : -1;
+    const currentRows = [...currentIndexes].map((index) =>
+        elements.songsTableBody.querySelector(`tr[data-song-index="${index}"]`)
+    );
+    const selectionRow = elements.songsTableBody.querySelector(`tr[data-song-index="${selectionIndex}"]`);
+    const rows = new Set([...oldRows, ...currentRows, selectionRow].filter(Boolean));
+    for (const row of rows) {
+        const rowIndex = Number(row.dataset.songIndex);
+        const isCurrent = currentIndexes.has(rowIndex);
+        const isSelected = rowIndex === selectionIndex;
+        row.classList.toggle("is-current", isCurrent);
+        row.classList.toggle("is-keyboard-selected", isSelected);
+        row.setAttribute("aria-selected", String(isSelected));
+        if (isCurrent) row.setAttribute("aria-current", "true");
+        else row.removeAttribute("aria-current");
+        const numberCell = row.querySelector(".song-row-nr");
+        if (isCurrent) {
+            const label = playbackState.playing ? "Now playing" : "Current track";
+            let marker = numberCell.querySelector(".song-current-marker");
+            if (!marker) {
+                numberCell.innerHTML = '<span class="song-current-marker"><span></span><span></span><span></span></span>';
+                marker = numberCell.firstElementChild;
+            }
+            marker.classList.toggle("is-playing", playbackState.playing);
+            marker.classList.toggle("is-paused", !playbackState.playing);
+            marker.setAttribute("aria-label", label);
+            marker.title = label;
+        } else {
+            numberCell.textContent = String(resolveDrawerDisplayNumber({
+                trackNo: context.items[rowIndex]?.track?.trackNo,
+                rowIndex,
+                forceRowOrder: Boolean(context.playlistId),
+            }));
+        }
+    }
 }
 
 function renderSongsDrawer() {
@@ -7453,7 +7501,7 @@ function syncBrowseToTrack(track) {
 
     if (nextIndex === state.browseIndex) {
         state.activeEntryKey = browseEntries[nextIndex]?.key || null;
-        updateUI();
+        updateUI({ playbackOnly: true });
         positionInfoPanel();
         return;
     }
@@ -7565,12 +7613,13 @@ async function playTrackList(tracks, index, queueKey) {
 
     playbackIntentPlaying = true;
     playbackState.playing = false;
-    updateUI();
+    updateUI({ playbackOnly: true });
 
     let sourceAtPlay = "";
     try {
         if (isServerCachedTrack(state.currentTrack)) {
-            const decision = await playbackDecisions.resolve(state.currentTrack.id);
+            const decision = playbackDecisions.peek(state.currentTrack.id)
+                || await playbackDecisions.resolve(state.currentTrack.id);
             if (loadId !== playbackLoadId) return;
             playbackDecision = decision;
         }
@@ -7580,6 +7629,7 @@ async function playTrackList(tracks, index, queueKey) {
         sourceAtPlay = elements.audioPlayer.src;
         elements.audioPlayer.load();
         scheduleStreamCacheHandoff(state.currentTrack);
+        prefetchUpcomingPlaybackTracks();
         if (pendingSeek?.trackKey === getTrackRecoveryKey()) {
             const prepareId = seekPrepareId;
             await waitForAudioReady(3200);
@@ -7592,7 +7642,6 @@ async function playTrackList(tracks, index, queueKey) {
         if (!playbackIntentPlaying) return;
         await elements.audioPlayer.play();
         if (loadId !== playbackLoadId) return;
-        prefetchUpcomingPlaybackTracks();
     } catch (error) {
         if (loadId !== playbackLoadId || (sourceAtPlay && sourceAtPlay !== elements.audioPlayer.src)) return;
         if (error?.name === "NotSupportedError" && await fallbackToCompatibleStream(error)) return;
@@ -7605,7 +7654,7 @@ async function playTrackList(tracks, index, queueKey) {
     }
 
     syncBrowseToTrack(state.currentTrack);
-    updateUI();
+    updateUI({ playbackOnly: true });
 }
 
 function prefetchUpcomingPlaybackTracks() {
@@ -8934,14 +8983,14 @@ function setupAudio() {
         playbackIntentPlaying = true;
         playbackState.playing = false;
         playbackState.timelineUpdatedAt = Date.now();
-        updateUI();
+        updateUI({ playbackOnly: true });
     });
 
     elements.audioPlayer.addEventListener("playing", () => {
         playbackState.playing = true;
         completePendingSeek();
         playbackState.timelineUpdatedAt = Date.now();
-        updateUI();
+        updateUI({ playbackOnly: true });
         scheduleSnapBackToPlaying();
         scheduleStreamCacheHandoff(state.currentTrack);
     });
@@ -8956,7 +9005,7 @@ function setupAudio() {
     elements.audioPlayer.addEventListener("pause", () => {
         playbackState.playing = false;
         playbackState.timelineUpdatedAt = Date.now();
-        updateUI();
+        updateUI({ playbackOnly: true });
         clearSnapBackTimer();
     });
 

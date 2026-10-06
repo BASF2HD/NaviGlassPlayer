@@ -45,7 +45,9 @@ Decisions for the next three songs are prefetched and cached until their signed 
 
 Press Down to open the song drawer, then Up or Down to select a song and Enter to play it. Space toggles playback with the drawer open or closed. With the drawer closed, Enter plays the centered album's first song or the centered song. Drawer numbers use album track metadata when available, or the visible row number when it is missing; playlists use their row order.
 
-The repeat button to the left of the timer cycles **Repeat Off → Repeat All → Repeat Song**. Repeat All loops the current playback queue (album, playlist, or song list); Repeat Song restarts the current track when it finishes, while manual Next still skips it. Shuffle, to the right of the seek bar, keeps the current song playing and randomizes the remaining queue without changing library or playlist order. Turning shuffle off restores normal order. These preferences are saved in this browser. Radio streams retain their existing reconnect behavior. The volume popup also works in fullscreen.
+The repeat button at the cover's left edge, before the timer, cycles **Repeat Off → Repeat All → Repeat Song**. Repeat All loops the current playback queue (album, playlist, or song list); Repeat Song restarts the current track when it finishes, while manual Next still skips it. Shuffle, at the cover's right edge, keeps the current song playing and randomizes the remaining queue without changing library or playlist order. Turning shuffle off restores normal order. The official Lucide icons are gray when off and white when on, with no circular background. Previous and Next have the same circular styling as Play/Pause. These preferences are saved in this browser. Radio streams retain their existing reconnect behavior. The volume popup also works in fullscreen.
+
+Song switches reuse prepared playback decisions synchronously and update the drawer's playing markers in place rather than rebuilding every row and browse menu. Upcoming decisions prepare while the current song buffers; network and decoding time can still affect playback startup.
 
 ## Export Music Lists
 
