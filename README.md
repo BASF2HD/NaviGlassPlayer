@@ -6,9 +6,9 @@ NaviGlassPlayer is a standalone, browser-based Navidrome player built around a r
 
 ## Mobile downloads
 
-**[NaviGlass for Android — 0.2.4 test APK](https://github.com/BASF2HD/NaviGlass-Android/releases/tag/v0.2.4)** · [Android source, screenshots and installation guide](https://github.com/BASF2HD/NaviGlass-Android)
+**[NaviGlass for Android — 0.2.5 test APK](https://github.com/BASF2HD/NaviGlass-Mobile/releases/tag/v0.2.5)** · [Mobile source, screenshots and installation guide](https://github.com/BASF2HD/NaviGlass-Mobile)
 
-Android 10+; local music, optional Navidrome and internet radio, portrait/landscape Cover Flow. This is an early, debug-signed test build, not a Play Store release. No login is preloaded. Please report Android issues in the Android repository. The APK is hosted/versioned there while this main repository remains the shared NaviGlass discovery hub; existing desktop downloads are unchanged.
+Android 10+; local music, optional Navidrome and internet radio, portrait/landscape Cover Flow. This is an early, debug-signed test build, not a Play Store release. No login is preloaded. Please report Android issues in the mobile repository. The APK is hosted/versioned there while this main repository remains the shared NaviGlass discovery hub; existing desktop downloads are unchanged.
 
 **iOS:** planned, not available yet. Android APKs do not run on iPhone. A future iOS beta will be linked here through TestFlight or another supported Apple distribution route.
 
