@@ -252,6 +252,8 @@ const initialSettings = loadSettings();
 
 let albumInfoFontScale = initialSettings.fontScale;
 let browseEntries = [];
+let browseCountKey = "";
+let browseCountFailed = false;
 let textures = [];
 let textureLoadPromises = new Map();
 let activeCoverHitBox = null;
@@ -3354,6 +3356,7 @@ function appendBrowseEntries(nextEntries) {
             jumpTo(nextIndex);
         }
         updateBrowseStripUI();
+        updateBrowseMenuCounts();
         ensureTextures();
         return Math.max(0, browseEntries.length - previousLength);
     }
@@ -3385,6 +3388,7 @@ function appendBrowseEntries(nextEntries) {
         jumpTo(nextIndex);
     }
     updateBrowseStripUI();
+    updateBrowseMenuCounts();
     ensureTextures();
     return uniqueEntries.length;
 }
@@ -3471,6 +3475,9 @@ async function continueProgressiveAlbumLoad(loadState) {
 
         await new Promise((resolve) => window.setTimeout(resolve, ALBUM_APPEND_YIELD_MS));
     }
+    if (progressiveAlbumLoad === loadState) {
+        updateBrowseMenuCounts();
+    }
 }
 
 async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}) {
@@ -3479,6 +3486,9 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
     }
 
     const requestId = ++browseLoadId;
+    browseCountKey = "";
+    browseCountFailed = false;
+    updateBrowseMenuCounts();
     state.pendingBrowseIndex = null;
     progressiveAlbumLoad = null;
     let nextBrowseMode = state.browseMode;
@@ -3494,6 +3504,7 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
     if (cachedBrowse) {
         activeBrowseEntryCacheKey = nextBrowseCacheKey;
         browseEntries = cachedBrowse.entries.slice();
+        browseCountKey = nextBrowseCacheKey;
         textures = buildTexturesForEntries(browseEntries);
 
         const currentTrackKey = keyForTrackInCurrentMode(state.currentTrack);
@@ -3535,6 +3546,7 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
         updateUI();
         positionInfoPanel();
         resumeProgressiveAlbumLoad(requestId, cachedBrowse.progressive);
+        updateBrowseMenuCounts();
         return;
     }
 
@@ -3572,6 +3584,7 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
 
         const resolvedBrowseCacheKey = getBrowseEntryCacheKey(nextBrowseMode);
         browseEntries = sortBrowseEntriesForCurrentMode(groupRawAlbumEntriesIfNeeded(entries));
+        browseCountKey = resolvedBrowseCacheKey;
         textures = buildTexturesForEntries(browseEntries, previousTextures);
 
         const currentTrackKey = keyForTrackInCurrentMode(state.currentTrack);
@@ -3615,11 +3628,14 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
         }
         activeBrowseEntryCacheKey = resolvedBrowseCacheKey;
         setBrowseEntryCache(resolvedBrowseCacheKey);
+        updateBrowseMenuCounts();
     } catch (error) {
         if (requestId !== browseLoadId) {
             return;
         }
         console.error(error);
+        browseCountFailed = true;
+        updateBrowseMenuCounts();
         hideStatus();
         flashStatus(error.message || "Could not load library.", 2600);
         if (!browseEntries.length) {
@@ -3999,10 +4015,74 @@ function renderDropdownCheck(checked) {
     return `<span class="browse-dropdown-check is-checked" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14"><path fill="currentColor" d="M6.2 11.6 2.8 8.2l1.2-1.2 2.2 2.2 5.8-5.8 1.2 1.2z"/></svg></span>`;
 }
 
-function renderBrowseDropdownHeader(title) {
+function getBrowseMenuCountText(mode) {
+    if (!state.connected) {
+        return "—";
+    }
+    const optionLists = {
+        [BROWSE_MODE.ARTIST]: state.artistOptions,
+        [BROWSE_MODE.ALBUM_ARTIST]: state.albumArtistOptions,
+        [BROWSE_MODE.COMPOSER]: state.composerOptions,
+        [BROWSE_MODE.PLAYLIST]: state.playlistOptions,
+    };
+    if (optionLists[mode]) {
+        return optionLists[mode].length.toLocaleString();
+    }
+    if (state.browseMode !== mode) {
+        return "—";
+    }
+    if (browseCountKey !== getBrowseEntryCacheKey(mode)) {
+        return browseCountFailed ? "Unavailable" : "Loading…";
+    }
+    const favouriteOnly = (mode === BROWSE_MODE.SONGS && state.settings.songsBrowseScope === "favourite")
+        || (mode === BROWSE_MODE.ALBUM && state.settings.albumBrowseScope === "favourite");
+    let count = 0;
+    for (const entry of browseEntries) {
+        if (mode === BROWSE_MODE.SONGS) {
+            const tracks = Array.isArray(entry.groupTracks) ? entry.groupTracks : [entry];
+            count += tracks.filter((track) => track.kind === "song" && (!favouriteOnly || track.starred)).length;
+        } else if ((mode === BROWSE_MODE.RADIO ? entry.kind === "radio" : entry.kind === "album")
+            && (!favouriteOnly || entry.starred)) {
+            count += 1;
+        }
+    }
+    const partial = progressiveAlbumLoad && !progressiveAlbumLoad.done ? "+" : "";
+    return `${count.toLocaleString()}${partial}`;
+}
+
+function getMoreBrowseCountMode() {
+    const panelMode = {
+        year: BROWSE_MODE.YEAR,
+        genre: BROWSE_MODE.GENRE,
+        radio: BROWSE_MODE.RADIO,
+    }[state.activeMorePanel] || null;
+    return panelMode || ([BROWSE_MODE.YEAR, BROWSE_MODE.GENRE, BROWSE_MODE.RADIO].includes(state.browseMode)
+        ? state.browseMode : null);
+}
+
+function updateBrowseMenuCounts() {
+    for (const [dropdown, mode] of [
+        [elements.albumDropdown, BROWSE_MODE.ALBUM],
+        [elements.songsDropdown, BROWSE_MODE.SONGS],
+        [elements.artistDropdown, browseModeForArtistPanel()],
+        [elements.playlistDropdown, BROWSE_MODE.PLAYLIST],
+        [elements.moreDropdown, getMoreBrowseCountMode()],
+    ]) {
+        const target = dropdown?.querySelector("[data-browse-menu-count]");
+        if (target && mode) {
+            target.textContent = getBrowseMenuCountText(mode);
+        }
+    }
+}
+
+function renderBrowseDropdownHeader(title, countText = "") {
     return `
         <div class="browse-dropdown-header">
-            <span class="browse-dropdown-title">${escapeHtml(title)}</span>
+            <div class="browse-dropdown-heading">
+                <span class="browse-dropdown-title">${escapeHtml(title)}</span>
+                ${countText ? `<span class="browse-dropdown-header-separator" aria-hidden="true">|</span>
+                <span class="browse-dropdown-header-count" data-browse-menu-count aria-live="polite">${escapeHtml(countText)}</span>` : ""}
+            </div>
             <button class="browse-dropdown-close" type="button" data-close-browse-dropdown aria-label="Close ${escapeHtml(title)} menu" title="Close">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path fill="currentColor" d="M18.3 5.71 12 12l6.3 6.29-1.41 1.41L10.59 13.4 4.29 19.7 2.88 18.29 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.29-6.3z"/>
@@ -4012,13 +4092,13 @@ function renderBrowseDropdownHeader(title) {
     `;
 }
 
-function finalizeBrowseDropdown(dropdown, title) {
+function finalizeBrowseDropdown(dropdown, title, countText = "") {
     const scrollContent = document.createElement("div");
     scrollContent.className = "browse-dropdown-scroll";
     while (dropdown.firstChild) {
         scrollContent.appendChild(dropdown.firstChild);
     }
-    dropdown.innerHTML = renderBrowseDropdownHeader(title);
+    dropdown.innerHTML = renderBrowseDropdownHeader(title, countText);
     dropdown.appendChild(scrollContent);
 }
 
@@ -4092,7 +4172,7 @@ function renderAlbumDropdown() {
             ${renderSortOptions(state.settings.albumBrowseSort, "album-sort")}
         </div>
     `;
-    finalizeBrowseDropdown(elements.albumDropdown, "Albums");
+    finalizeBrowseDropdown(elements.albumDropdown, "Albums", getBrowseMenuCountText(BROWSE_MODE.ALBUM));
 }
 
 function renderSongsDropdown() {
@@ -4132,7 +4212,7 @@ function renderSongsDropdown() {
             ${renderSortOptions(state.settings.songsBrowseSort, "songs-sort")}
         </div>
     `;
-    finalizeBrowseDropdown(elements.songsDropdown, "Songs");
+    finalizeBrowseDropdown(elements.songsDropdown, "Songs", getBrowseMenuCountText(BROWSE_MODE.SONGS));
 }
 
 function renderArtistDropdown() {
@@ -4208,7 +4288,8 @@ function renderArtistDropdown() {
             ${activePanel === "composer" ? composerItems : activePanel === "albumArtist" ? albumArtistItems : artistItems}
         </div>
     `;
-    finalizeBrowseDropdown(elements.artistDropdown, "Artists");
+    const title = activePanel === "albumArtist" ? "Album Artists" : activePanel === "composer" ? "Composers" : "Artists";
+    finalizeBrowseDropdown(elements.artistDropdown, title, getBrowseMenuCountText(browseModeForArtistPanel()));
 }
 
 function renderPlaylistDropdown() {
@@ -4244,7 +4325,7 @@ function renderPlaylistDropdown() {
             ${playlistHtml}
         </div>
     `;
-    finalizeBrowseDropdown(elements.playlistDropdown, "Playlists");
+    finalizeBrowseDropdown(elements.playlistDropdown, "Playlists", getBrowseMenuCountText(BROWSE_MODE.PLAYLIST));
 }
 
 function renderMoreDropdown() {
@@ -4332,7 +4413,8 @@ function renderMoreDropdown() {
             }
         </div>
     `;
-    finalizeBrowseDropdown(elements.moreDropdown, "More");
+    const countMode = getMoreBrowseCountMode();
+    finalizeBrowseDropdown(elements.moreDropdown, "More", countMode ? getBrowseMenuCountText(countMode) : "");
 }
 
 function renderSettingsDropdown() {
@@ -7343,8 +7425,10 @@ function entryContainsPlaybackTrack(entry, track) {
     if (!entry || !track) {
         return false;
     }
-    if (Array.isArray(entry.groupTracks) && entry.groupTracks.some((groupTrack) => trackIdentityMatches(groupTrack, track))) {
-        return true;
+    if (Array.isArray(entry.groupTracks)) {
+        // A grouped selection contains only its listed songs. Album metadata can
+        // overlap across groups, so falling back to it can restart a finished group.
+        return entry.groupTracks.some((groupTrack) => trackIdentityMatches(groupTrack, track));
     }
     if (entry.kind === "song") {
         return trackIdentityMatches(entry, track);
@@ -8195,6 +8279,7 @@ async function toggleTrackFavourite(track) {
     updateTrackEverywhere(track.id, (item) => {
         item.starred = nextStarred;
     });
+    updateBrowseMenuCounts();
     renderSongsDrawer();
     updateBrowseSummary();
     try {
@@ -8205,6 +8290,7 @@ async function toggleTrackFavourite(track) {
         updateTrackEverywhere(track.id, (item) => {
             item.starred = !nextStarred;
         });
+        updateBrowseMenuCounts();
         renderSongsDrawer();
         updateBrowseSummary();
         flashStatus(`Could not update favourite: ${error?.message || error}`, 2600);
@@ -8228,6 +8314,7 @@ async function toggleAlbumFavourite(albumEntry) {
         item.starred = nextStarred;
         item.albumStarred = nextStarred;
     });
+    updateBrowseMenuCounts();
     renderSongsDrawer();
     updateBrowseSummary();
     try {
@@ -8239,6 +8326,7 @@ async function toggleAlbumFavourite(albumEntry) {
             item.starred = !nextStarred;
             item.albumStarred = !nextStarred;
         });
+        updateBrowseMenuCounts();
         renderSongsDrawer();
         updateBrowseSummary();
         flashStatus(`Could not update favourite: ${error?.message || error}`, 2600);
@@ -8264,6 +8352,7 @@ async function toggleDrawerAlbumFavourite() {
         item.starred = nextStarred;
         item.albumStarred = nextStarred;
     });
+    updateBrowseMenuCounts();
     renderSongsDrawer();
     updateBrowseSummary();
     try {
@@ -8275,6 +8364,7 @@ async function toggleDrawerAlbumFavourite() {
             item.starred = !nextStarred;
             item.albumStarred = !nextStarred;
         });
+        updateBrowseMenuCounts();
         renderSongsDrawer();
         updateBrowseSummary();
         flashStatus(`Could not update favourite: ${error?.message || error}`, 2600);
