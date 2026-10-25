@@ -57,6 +57,14 @@ The repeat button at the cover's left edge, before the timer, cycles **Repeat Of
 
 Song switches reuse prepared playback decisions synchronously and update the drawer's playing markers in place rather than rebuilding every row and browse menu. Upcoming decisions prepare while the current song buffers; network and decoding time can still affect playback startup.
 
+## USB and audio output selection
+
+Open **Settings → Audio output / USB DAC** to choose an output connected to the device running the browser. The current song, queue and playback position are retained. **System default** returns routing to the operating system. A saved DAC falls back to the default when disconnected and restores when it becomes available again; revoked browser permissions may require choosing it again.
+
+Output switching requires HTTPS or localhost and a compatible browser. **Choose output** uses the browser's device picker when available. Otherwise **Allow device discovery** may request microphone permission to expose the output list; capture is stopped immediately and no audio is recorded or transmitted. Discovery never runs automatically. Unsupported browsers show guidance to use system sound settings. This selects system audio routing; it does not provide exclusive or bit-perfect playback, or control a DAC attached to a different server.
+
+Validation: 79 Node tests pass, including saved-device reconnection, switching without resetting playback, permission failure, explicit-only discovery, capture cleanup, racing selections and unsupported-browser fallback. The real Settings UI and refresh/default controls were reviewed locally. Physical USB DAC routing still requires testing with the user's hardware.
+
 ## Export Music Lists
 
 Open **Settings → Export music lists** to create a UTF-8 CSV for filtering and curating saved music.

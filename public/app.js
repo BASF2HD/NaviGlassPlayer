@@ -29,6 +29,7 @@ import {
 import { audioStreamParams, isTimeInRanges, needsSeekRecovery, streamElapsed, streamDuration, needsServerOffsetSeek } from "./audio-seek.js?v=3";
 import { browserPlaybackProfile, createPlaybackDecisions, decisionStreamParams } from "./navidrome-playback.js?v=2";
 import { normalizeRepeatMode, nextRepeatMode, buildPlaybackOrder, playbackStep, samePlaybackQueue } from "./playback-order.js?v=1";
+import { createAudioOutputSettings } from "./audio-output.js?v=1";
 
 const STORAGE_KEY = "naviglassplayer-settings";
 const LEGACY_SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
@@ -249,6 +250,7 @@ const browseButtons = [
 ];
 
 const initialSettings = loadSettings();
+const audioOutputSettings = createAudioOutputSettings(elements.audioPlayer);
 
 let albumInfoFontScale = initialSettings.fontScale;
 let browseEntries = [];
@@ -4452,6 +4454,10 @@ function renderSettingsDropdown() {
             </button>
         </div>
     `;
+    const outputSection = document.createElement("div");
+    outputSection.className = "browse-dropdown-section";
+    outputSection.append(audioOutputSettings);
+    elements.settingsDropdown.append(outputSection);
     finalizeBrowseDropdown(elements.settingsDropdown, "Settings");
 }
 

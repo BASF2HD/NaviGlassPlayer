@@ -2338,6 +2338,13 @@ body.is-player-fullscreen .player-fullscreen-button,
     gap: max(4px, var(--menu-item-gap));
 }
 
+.audio-output-settings { display: flex; flex-direction: column; gap: 9px; min-width: 0; }
+.audio-output-settings label { font-size: 13px; font-weight: 700; }
+.audio-output-settings select { width: 100%; min-width: 0; min-height: 38px; color: #f4f6ff; background: #161820; border: 1px solid #ffffff30; border-radius: 6px; padding: 6px 8px; font: inherit; }
+.audio-output-settings .settings-step-btn { min-height: 36px; }
+.audio-output-hint, .audio-output-status { margin: 0; color: #b5b8c5; white-space: normal; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.audio-output-status:empty { display: none; }
+
 .settings-summary {
     display: flex;
     align-items: center;
