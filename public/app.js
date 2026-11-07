@@ -6295,7 +6295,13 @@ function renderSongsDrawer() {
     const context = state.drawerContext;
     const items = context.items || [];
     elements.songsDrawerEyebrow.textContent = context.loading ? "Loading..." : "Tracks";
-    elements.songsDrawerTitle.textContent = albumTitleWithYear(context.title, context.albumYear);
+    const drawerTitle = albumTitleWithYear(context.title, context.albumYear);
+    const drawerYear = drawerTitle.match(/\((?:19|20)\d{2}\)$/)?.[0] || "";
+    const drawerName = drawerYear ? drawerTitle.slice(0, -drawerYear.length).trimEnd() : drawerTitle;
+    elements.songsDrawerTitle.innerHTML = `<span class="songs-drawer-title-name">${escapeHtml(drawerName)}</span>`
+        + (drawerYear ? `<span class="songs-drawer-title-year">${escapeHtml(drawerYear)}</span>` : "");
+    elements.songsDrawerTitle.title = drawerTitle;
+    elements.songsDrawerTitle.setAttribute("aria-label", drawerTitle);
     elements.songsDrawerSubtitle.textContent = context.subtitle || "\u00A0";
     elements.songsDrawerCount.textContent = context.loading ? "..." : formatCount(items.length, "song");
     const hasAlbumContext = Boolean(context.albumId);

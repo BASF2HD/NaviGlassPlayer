@@ -347,13 +347,29 @@ body.is-player-fullscreen #controls,
 }
 
 .songs-drawer-title {
+    display: flex;
+    align-items: baseline;
+    gap: 0.3em;
+    min-width: 0;
     font-size: var(--drawer-title-size);
     font-weight: 600;
     line-height: 1.2;
     color: rgba(247, 249, 255, 0.96);
     white-space: nowrap;
     overflow: hidden;
+}
+
+.songs-drawer-title-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.songs-drawer-title-year {
+    flex: 0 0 auto;
+    white-space: nowrap;
 }
 
 .song-info-title {
