@@ -30,6 +30,8 @@ import { audioStreamParams, isTimeInRanges, needsSeekRecovery, streamElapsed, st
 import { browserPlaybackProfile, createPlaybackDecisions, decisionStreamParams } from "./navidrome-playback.js?v=2";
 import { normalizeRepeatMode, nextRepeatMode, buildPlaybackOrder, playbackStep, samePlaybackQueue } from "./playback-order.js?v=1";
 import { createAudioOutputSettings } from "./audio-output.js?v=1";
+import { metadataText, readMusicMetadata } from "./music-metadata.js?v=1";
+import { createRequestQueue } from "./request-queue.js?v=1";
 
 const STORAGE_KEY = "naviglassplayer-settings";
 const LEGACY_SESSION_PASSWORD_KEY = "naviglassplayer-session-password";
@@ -52,7 +54,7 @@ const CACHE_DB_NAME = "naviglassplayer-cache";
 const CACHE_DB_VERSION = 1;
 const BROWSE_CACHE_STORE = "browseViews";
 const ARTWORK_CACHE_STORE = "artwork";
-const BROWSE_CACHE_SCHEMA_VERSION = 5;
+const BROWSE_CACHE_SCHEMA_VERSION = 6;
 const PERSISTENT_BROWSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PERSISTENT_ARTWORK_ITEMS = 3500;
 const STREAM_CACHE_SEEK_WAIT_MS = 45000;
@@ -305,6 +307,9 @@ let activeBrowseEntryCacheKey = "";
 let coverTextureCache = new Map();
 let albumDetailsLoadPromises = new Map();
 let drawerDetailPrefetchTimerId = 0;
+let drawerContextLoad = null;
+const albumDetailPrefetchQueue = createRequestQueue(2);
+const artworkRequestQueue = createRequestQueue(2);
 let songMenuPositionFrameId = 0;
 let cacheDbPromise = null;
 let activeLibraryCacheScope = "";
@@ -596,23 +601,6 @@ function pickText(...values) {
         const text = String(value ?? "").trim();
         if (text) {
             return text;
-        }
-    }
-    return "";
-}
-
-function pickMetadataText(...values) {
-    for (const value of values) {
-        const parts = ensureArray(value)
-            .map((item) => {
-                if (item && typeof item === "object") {
-                    return pickText(item.name, item.value, item.title, item.id);
-                }
-                return pickText(item);
-            })
-            .filter(Boolean);
-        if (parts.length) {
-            return [...new Set(parts)].join(", ");
         }
     }
     return "";
@@ -939,19 +927,22 @@ async function loadArtworkTexture(entry, coverUrl, coverKey) {
         if (cachedTexture && cachedTexture !== getDefaultTexture()) {
             return cachedTexture;
         }
-        try {
-            const response = await fetch(coverUrl, { headers: { accept: "image/*" } });
-            if (response.ok) {
-                const blob = await response.blob();
-                persistArtworkBlob(coverKey, blob);
-                const texture = await loadTextureFromBlob(blob);
-                if (texture && texture !== getDefaultTexture()) {
-                    return texture;
+        return artworkRequestQueue.run(async () => {
+            try {
+                const response = await fetch(coverUrl, { headers: { accept: "image/*" }, priority: "low" });
+                if (response.ok) {
+                    const blob = await response.blob();
+                    persistArtworkBlob(coverKey, blob);
+                    const texture = await loadTextureFromBlob(blob);
+                    if (texture && texture !== getDefaultTexture()) {
+                        return texture;
+                    }
                 }
+            } catch {
+                // Fall back to the image loader below; remote artwork can be CORS-sensitive.
             }
-        } catch {
-            // Fall back to the image loader below; remote artwork can be CORS-sensitive.
-        }
+            return loadTexture(coverUrl);
+        }, { priority: () => entry?.key === state.activeEntryKey ? 1 : 0 });
     }
     return loadTexture(coverUrl);
 }
@@ -1058,13 +1049,14 @@ async function fetchJson(path, params = {}) {
     );
 }
 
-async function fetchServerCachedJson(path, params = {}) {
+async function fetchServerCachedJson(path, params = {}, { priority = "high" } = {}) {
     const modes = state.authMode === "token" ? ["token", "encoded"] : [state.authMode];
     let lastError;
 
     for (const authMode of modes) {
         const response = await fetch(buildServerApiUrl(path, params, { authMode }), {
             headers: { accept: "application/json" },
+            priority,
         });
 
         let payload;
@@ -1092,16 +1084,6 @@ async function fetchServerCachedJson(path, params = {}) {
     throw new Error(
         `${lastError?.message || "Wrong username or password"}. Use your Navidrome app login, not the Linux SSH password.`
     );
-}
-
-function warmServerAlbumDetails(albumIds) {
-    const ids = [...new Set(albumIds.map(String).filter(Boolean))];
-    if (!ids.length) {
-        return;
-    }
-    fetch(buildServerApiUrl("/api/cache/navidrome/warm-albums", { ids: ids.join(",") }), {
-        headers: { accept: "application/json" },
-    }).catch(() => {});
 }
 
 function shouldUsePhoneSeekCache() {
@@ -1337,7 +1319,8 @@ function playbackUrl(track) {
 }
 
 function normalizeAlbum(album) {
-    const artist = pickText(album.artist, "Unknown Artist");
+    const metadata = readMusicMetadata(album, { isAlbum: true });
+    const artist = metadata.albumArtist || "Unknown Artist";
     const year = String(album.year || "").trim();
     const userRating = Number(album.userRating || album.rating || 0);
     const averageRating = Number(album.averageRating || 0);
@@ -1348,6 +1331,8 @@ function normalizeAlbum(album) {
         title: pickText(album.name, "Untitled Album"),
         subtitle: [artist, year].filter(Boolean).join("  ·  "),
         artist,
+        ...metadata,
+        genre: pickText(album.genre),
         coverArt: album.coverArt || album.id,
         songCount: Number(album.songCount || 0),
         year,
@@ -1370,8 +1355,9 @@ function shouldFallbackFromEmptyMode(mode) {
 function normalizeTrack(track, options = {}) {
     const id = String(track.id || options.fallbackId || "");
     const albumId = String(track.albumId || track.parent || options.albumId || "");
-    const artist = pickText(track.artist, track.artistName, track.albumArtist, options.artist, "Unknown Artist");
-    const albumArtist = pickText(track.albumArtist, track.albumArtistName, options.albumArtist, artist);
+    const metadata = readMusicMetadata(track, options);
+    const artist = metadataText(track.displayArtist, track.artist, track.artistName, track.artists,
+        options.artist, metadata.albumArtist) || "Unknown Artist";
     const album = pickText(
         track.album,
         track.albumName,
@@ -1383,7 +1369,6 @@ function normalizeTrack(track, options = {}) {
     );
     const year = String(track.year || options.year || "");
     const genre = pickText(track.genre, options.genre);
-    const composer = pickMetadataText(track.displayComposer, track.composer, track.composers, options.composer);
 
     return {
         kind: "song",
@@ -1394,7 +1379,7 @@ function normalizeTrack(track, options = {}) {
         title: pickText(track.title, `Track ${(options.index || 0) + 1}`),
         subtitle: [artist, album].filter(Boolean).join("  ·  "),
         artist,
-        albumArtist,
+        ...metadata,
         album,
         albumId,
         coverArt: track.coverArt || options.coverArt || albumId || id || "",
@@ -1404,7 +1389,6 @@ function normalizeTrack(track, options = {}) {
         suffix: pickText(track.suffix, options.suffix),
         year,
         genre,
-        composer,
         starred: Boolean(track.starred),
         file: pickText(track.path, track.file),
         source: options.source || "library",
@@ -1820,7 +1804,8 @@ async function buildAlbumGroupEntries(tracks, { source, contextId = source } = {
                 key: `album-group:${source}:${contextId}:${albumKey}`,
                 id: track.albumId || albumKey,
                 title: pickText(track.album, "Unknown Album"),
-                artist: pickText(track.artist, "Unknown Artist"),
+                artist: pickText(track.albumArtist, track.artist, "Unknown Artist"),
+                albumArtist: track.albumArtist || "",
                 subtitle: "",
                 coverArt: track.coverArt || track.albumId || track.id,
                 year: track.year || "",
@@ -1988,7 +1973,7 @@ async function ensureArtistOptions(force = false) {
 function normalizeAlbumArtistOptions(albums) {
     const albumArtists = new Map();
     for (const album of albums) {
-        const value = pickText(album?.artist, "Unknown Album Artist");
+        const value = pickText(album?.albumArtist, album?.artist, "Unknown Album Artist");
         const key = value.toLocaleLowerCase();
         const existing = albumArtists.get(key) || {
             value,
@@ -2442,7 +2427,7 @@ async function fetchAlbumArtistSongs() {
     }
     const selectedKey = selectedAlbumArtist.value.toLocaleLowerCase();
     const albums = state.albumArtistAlbumCache.filter(
-        (album) => pickText(album?.artist, "Unknown Album Artist").toLocaleLowerCase() === selectedKey
+        (album) => pickText(album?.albumArtist, album?.artist, "Unknown Album Artist").toLocaleLowerCase() === selectedKey
     );
 
     if (state.settings.artistDisplayMode === TRACK_DISPLAY_MODE.ALBUM) {
@@ -2967,6 +2952,11 @@ function invalidateBrowseEntryCache(mode = "", { persistent = true } = {}) {
 }
 
 function invalidateLibraryCaches({ persistent = true } = {}) {
+    drawerLoadId += 1;
+    drawerContextLoad = null;
+    state.drawerContext = { key: "", title: "Songs", subtitle: "", items: [], loading: false, albumId: "", albumStarred: false };
+    albumDetailPrefetchQueue.clear();
+    artworkRequestQueue.clear();
     invalidateBrowseEntryCache("", { persistent });
     textureLoadPromises.clear();
     radioCoverLookupPromises.clear();
@@ -2991,7 +2981,7 @@ function invalidateLibraryCaches({ persistent = true } = {}) {
     state.genreOptions = [];
 }
 
-async function ensureAlbumDetails(albumId) {
+async function ensureAlbumDetails(albumId, { prefetch = false } = {}) {
     const key = `album:${albumId}`;
     if (state.detailsCache.has(key)) {
         return state.detailsCache.get(key);
@@ -2999,8 +2989,10 @@ async function ensureAlbumDetails(albumId) {
     if (albumDetailsLoadPromises.has(key)) {
         return albumDetailsLoadPromises.get(key);
     }
+    const scope = getLibraryCacheScope();
     const loadPromise = (async () => {
-        const payload = await fetchServerCachedJson("/api/cache/navidrome/album", { id: albumId });
+        const payload = await fetchServerCachedJson("/api/cache/navidrome/album", { id: albumId },
+            { priority: prefetch ? "low" : "high" });
         const album = normalizeAlbum(payload.album || {});
         album.tracks = ensureArray(payload.album?.song).map((track, index) =>
             normalizeTrack(track, {
@@ -3009,16 +3001,18 @@ async function ensureAlbumDetails(albumId) {
                 albumId: album.id,
                 albumTitle: album.title,
                 artist: album.artist,
+                albumArtist: album.albumArtist,
+                composer: album.composerSource === "tag" ? album.composer : "",
                 coverArt: album.coverArt || album.id,
                 year: album.year,
                 key: `song:album:${album.id}:${track.id || index}`,
                 index,
             })
         );
-        state.detailsCache.set(key, album);
+        if (scope === getLibraryCacheScope()) state.detailsCache.set(key, album);
         return album;
     })().finally(() => {
-        albumDetailsLoadPromises.delete(key);
+        if (albumDetailsLoadPromises.get(key) === loadPromise) albumDetailsLoadPromises.delete(key);
     });
     albumDetailsLoadPromises.set(key, loadPromise);
     return loadPromise;
@@ -3037,13 +3031,13 @@ function albumDetailIdsForEntry(entry) {
 
 function prefetchAlbumDetailIds(albumIds) {
     const uniqueIds = [...new Set(albumIds.map(String).filter(Boolean))];
-    warmServerAlbumDetails(uniqueIds);
+    albumDetailPrefetchQueue.clear();
     for (const albumId of uniqueIds.slice(0, DRAWER_DETAIL_PREFETCH_MAX_ALBUMS)) {
         const key = `album:${albumId}`;
         if (state.detailsCache.has(key) || albumDetailsLoadPromises.has(key)) {
             continue;
         }
-        ensureAlbumDetails(albumId).catch(() => {});
+        albumDetailPrefetchQueue.run(() => ensureAlbumDetails(albumId, { prefetch: true })).catch(() => {});
     }
 }
 
@@ -3166,7 +3160,7 @@ async function getDrawerContextForEntry(entry) {
 
     if (Array.isArray(entry.groupAlbumIds) && entry.groupAlbumIds.length) {
         const albums = await Promise.all(
-            entry.groupAlbumIds.map((albumId) => ensureAlbumDetails(albumId).catch(() => null))
+            entry.groupAlbumIds.map((albumId) => ensureAlbumDetails(albumId))
         );
         const tracks = albums
             .filter(Boolean)
@@ -3245,19 +3239,31 @@ async function getDrawerContextForEntry(entry) {
     };
 }
 
+function drawerContextSignature(entry) {
+    return JSON.stringify([
+        entry?.key,
+        entry?.groupAlbumIds || entry?.drawerAlbumId || entry?.albumId || entry?.id,
+        entry?.groupTracks?.map((track) => track.key || track.id),
+    ]);
+}
+
 async function ensureDrawerContext() {
     const entry = getCurrentBrowseEntry();
     const entryKey = entry?.key || "";
 
     if (!entry) {
+        drawerLoadId += 1;
+        drawerContextLoad = null;
         state.drawerContext = { key: "", title: "Songs", subtitle: "", items: [], loading: false, albumId: "", albumStarred: false };
         renderSongsDrawer();
         return state.drawerContext;
     }
 
-    if (!state.drawerOpen && state.drawerContext.key === entryKey && !state.drawerContext.loading) {
+    const signature = drawerContextSignature(entry);
+    if (state.drawerContext.signature === signature && !state.drawerContext.loading && !state.drawerContext.error) {
         return state.drawerContext;
     }
+    if (drawerContextLoad?.signature === signature) return drawerContextLoad.promise;
 
     const requestId = ++drawerLoadId;
     state.drawerContext = {
@@ -3268,22 +3274,33 @@ async function ensureDrawerContext() {
         loading: true,
         albumId: "",
         albumStarred: false,
+        signature,
     };
     renderSongsDrawer();
 
-    const context = await getDrawerContextForEntry(entry);
-    if (requestId !== drawerLoadId) {
+    const promise = (async () => {
+        try {
+            const context = await getDrawerContextForEntry(entry);
+            if (requestId !== drawerLoadId) return state.drawerContext;
+            state.drawerContext = { ...context, key: entryKey, signature, loading: false };
+            playbackDecisions.prefetch(context.items.map(({ track }) => track).filter(isServerCachedTrack).map((track) => track.id));
+        } catch (error) {
+            if (requestId !== drawerLoadId) return state.drawerContext;
+            state.drawerContext = {
+                ...state.drawerContext, loading: false,
+                error: "Could not load songs. Close and reopen the drawer to retry.",
+            };
+            console.warn("Unable to load drawer songs", error);
+        }
+        renderSongsDrawer();
         return state.drawerContext;
+    })();
+    drawerContextLoad = { signature, promise };
+    try {
+        return await promise;
+    } finally {
+        if (drawerContextLoad?.promise === promise) drawerContextLoad = null;
     }
-
-    state.drawerContext = {
-        ...context,
-        key: entryKey,
-        loading: false,
-    };
-    playbackDecisions.prefetch(context.items.map(({ track }) => track).filter(isServerCachedTrack).map((track) => track.id));
-    renderSongsDrawer();
-    return state.drawerContext;
 }
 
 async function connect({ onAuthenticated } = {}) {
@@ -3329,8 +3346,6 @@ async function connect({ onAuthenticated } = {}) {
 async function warmMenus() {
     await Promise.allSettled([
         ensureArtistOptions(),
-        ensureAlbumArtistOptions(),
-        ensureComposerOptions(),
         ensurePlaylistOptions(),
         ensureGenreOptions(),
     ]);
@@ -6317,7 +6332,7 @@ function renderSongsDrawer() {
         state.drawerSelectionIndex = null;
         elements.songsTableBody.innerHTML = `
             <tr class="songs-empty-row">
-                <td colspan="4">No songs available for this view yet.</td>
+                <td colspan="4">${escapeHtml(context.error || "No songs available for this view yet.")}</td>
             </tr>
         `;
         return;
@@ -6478,7 +6493,9 @@ function buildSongInfoRows(track, index) {
         ["Nr", index + 1],
         ["Title", track?.title || "Unknown Title"],
         ["Artist", track?.artist || "Unknown Artist"],
-        ["Composer", track?.composer || "Unknown"],
+        ["Album Artist", track?.albumArtist || "Unknown"],
+        ["Composer", track?.composer
+            ? `${track.composer}${track.composerSource === "albumArtist" ? " (Album Artist)" : ""}` : "Unknown"],
         ["Album", track?.album || "Unknown Album"],
         ["Duration", track?.duration ? formatClock(track.duration) : "Unknown"],
         ["Codec", track?.suffix ? String(track.suffix).toUpperCase() : "Unknown"],
@@ -6500,15 +6517,18 @@ function buildSongInfoRows(track, index) {
 }
 
 function buildAlbumInfoRows(album) {
-    const composers = [...new Set(
-        ensureArray(album?.tracks)
-            .map((track) => track?.composer)
-            .filter(Boolean)
-    )].join(", ");
+    const tracks = ensureArray(album?.tracks);
+    const taggedComposers = tracks.filter((track) => track.composerSource !== "albumArtist")
+        .map((track) => track.composer).filter(Boolean);
+    const composers = metadataText([...new Set(taggedComposers)],
+        album?.composerSource !== "albumArtist" ? album?.composer : "");
+    const albumArtist = metadataText(album?.albumArtist, tracks.map((track) => track.albumArtist));
+    const composerDisplay = composers || (albumArtist ? `${albumArtist} (Album Artist)` : "Unknown");
     const rows = [
         ["Title", album?.title || "Untitled Album"],
         ["Artist", album?.artist || "Unknown Artist"],
-        ["Composer", composers || "Unknown"],
+        ["Album Artist", albumArtist || "Unknown"],
+        ["Composer", composerDisplay],
         ["Songs", album?.tracks?.length || album?.songCount || "Unknown"],
         ["Duration", album?.duration ? formatClock(album.duration, album.duration >= 3600) : "Unknown"],
         ["Genre", album?.genre || "Unknown"],
@@ -6542,6 +6562,7 @@ async function resolveAlbumInfoDetails(albumEntry) {
             ...albumEntry,
             title: albumEntry.title || albums[0]?.title || "Album Info",
             artist: albumEntry.artist || albums[0]?.artist || "",
+            albumArtist: metadataText(albums.map((album) => album.albumArtist), albumEntry.albumArtist),
             year: years.length > 1 ? `${years[0]}-${years[years.length - 1]}` : years[0] || albumEntry.year || "",
             genre: genres.join(", ") || albumEntry.genre || "",
             duration: albums.reduce((total, album) => total + Number(album.duration || 0), 0),

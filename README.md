@@ -49,7 +49,15 @@ https://basf2hd.github.io/NaviGlassPlayer/
 
 Choosing a sort order starts at the first result: **Year: High to Low** opens at the newest album and **Year: Low to High** at the oldest. Cached views and additional album pages retain the selected order. Albums without a year appear last, with titles breaking ties between matching years. Ordinary library reloads retain the selected album, and changing the browse order does not interrupt playback.
 
-Validation: 86 Node tests pass, including both year directions with fresh and cached results, unknown-year handling, selection preservation, and ordering across an additional 220-album page.
+Sorting regressions cover both year directions with fresh and cached results, unknown-year handling, selection preservation, and ordering across an additional 220-album page.
+
+## Album artists, composers and drawer loading
+
+Song and album **More Info** shows **Album Artist** separately from the performing artist. NaviGlass reads Navidrome's display fields, structured album-artist arrays and composer contributors as well as legacy tags. Explicit composer tags take precedence. When Composer is missing, a known Album Artist supplies the value and More Info labels the fallback **(Album Artist)**. A singer is not substituted for a missing album artist, and server tags are never changed.
+
+The song drawer shares pending requests for the same selection and reuses loaded rows when reopened. Failed requests leave the loading state with retry guidance. Background artwork and album-detail prefetching each use at most two concurrent requests, while the selected cover and foreground metadata receive priority. Album Artist and Composer library scans run when those menus are selected instead of on every connection. Older normalized browse caches are rebuilt once to read the new metadata fields; saved login settings and artwork caches are retained.
+
+Validation: all 100 Node tests pass. The synthetic browser check confirmed distinct Artist, Album Artist and Composer values, the labelled composer fallback, immediate cached drawer rows, a two-request artwork maximum, no full-song scan at startup and one selected-album metadata request across drawer reopening.
 
 ## Audio Playback And Keyboard Controls
 
@@ -69,7 +77,7 @@ Open **Settings → Audio output / USB DAC** to choose an output connected to th
 
 Output switching requires HTTPS or localhost and a compatible browser. **Choose output** uses the browser's device picker when available. Otherwise **Allow device discovery** may request microphone permission to expose the output list; capture is stopped immediately and no audio is recorded or transmitted. Discovery never runs automatically. Unsupported browsers show guidance to use system sound settings. This selects system audio routing; it does not provide exclusive or bit-perfect playback, or control a DAC attached to a different server.
 
-Validation: 79 Node tests pass, including saved-device reconnection, switching without resetting playback, permission failure, explicit-only discovery, capture cleanup, racing selections and unsupported-browser fallback. The real Settings UI and refresh/default controls were reviewed locally. Physical USB DAC routing still requires testing with the user's hardware.
+USB output regression checks cover saved-device reconnection, switching without resetting playback, permission failure, explicit-only discovery, capture cleanup, racing selections and unsupported-browser fallback. The real Settings UI and refresh/default controls were reviewed locally. Physical USB DAC routing still requires testing with the user's hardware.
 
 ## Export Music Lists
 
