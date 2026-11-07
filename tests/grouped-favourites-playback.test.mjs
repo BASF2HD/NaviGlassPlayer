@@ -6,6 +6,7 @@ import {
     albumReleaseYearsMatch, albumTitleYearIdentity, normalizeAlbumGroupTitle,
 } from "../public/album-identity.js";
 import { buildPlaybackOrder, playbackStep } from "../public/playback-order.js";
+import { commonAlbumYear } from "../public/music-metadata.js";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
@@ -22,6 +23,7 @@ async function fixture(tracks) {
         state, browseEntries: [], played, playbackState: {}, playbackIntentPlaying: true,
         BROWSE_MODE: { SONGS: "songs" },
         albumReleaseYearsMatch, albumTitleYearIdentity, normalizeAlbumGroupTitle,
+        commonAlbumYear,
         buildPlaybackOrder, playbackStep,
         alphaCollator: new Intl.Collator(undefined, { numeric: true, sensitivity: "base" }),
         pickText: (...values) => values.find((value) => String(value || "").trim()) || "",

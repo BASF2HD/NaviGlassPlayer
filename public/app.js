@@ -30,7 +30,7 @@ import { audioStreamParams, isTimeInRanges, needsSeekRecovery, streamElapsed, st
 import { browserPlaybackProfile, createPlaybackDecisions, decisionStreamParams } from "./navidrome-playback.js?v=2";
 import { normalizeRepeatMode, nextRepeatMode, buildPlaybackOrder, playbackStep, samePlaybackQueue } from "./playback-order.js?v=1";
 import { createAudioOutputSettings } from "./audio-output.js?v=1";
-import { metadataText, readMusicMetadata } from "./music-metadata.js?v=1";
+import { metadataText, readMusicMetadata, commonAlbumYear, albumTitleWithYear } from "./music-metadata.js?v=2";
 import { createRequestQueue } from "./request-queue.js?v=1";
 
 const STORAGE_KEY = "naviglassplayer-settings";
@@ -54,7 +54,7 @@ const CACHE_DB_NAME = "naviglassplayer-cache";
 const CACHE_DB_VERSION = 1;
 const BROWSE_CACHE_STORE = "browseViews";
 const ARTWORK_CACHE_STORE = "artwork";
-const BROWSE_CACHE_SCHEMA_VERSION = 6;
+const BROWSE_CACHE_SCHEMA_VERSION = 7;
 const PERSISTENT_BROWSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PERSISTENT_ARTWORK_ITEMS = 3500;
 const STREAM_CACHE_SEEK_WAIT_MS = 45000;
@@ -3154,6 +3154,7 @@ async function getDrawerContextForEntry(entry) {
             playlistId: entry.source === BROWSE_MODE.PLAYLIST ? String(entry.contextId || "") : "",
             playlistName: "",
             albumId: entry.id,
+            albumYear: entry.year || commonAlbumYear(entry.groupTracks.map((track) => track.year)),
             items,
         };
     }
@@ -3170,6 +3171,7 @@ async function getDrawerContextForEntry(entry) {
             title: entry.title,
             subtitle: entry.subtitle || entry.artist,
             albumId: entry.groupAlbumIds[0] || entry.id,
+            albumYear: entry.year || commonAlbumYear(albums.map((album) => album.year)),
             albumStarred: Boolean(entry.starred),
             items: sortDrawerItemsByTrackNumber(tracks.map((track, index) => ({ track, index }))),
         };
@@ -3182,6 +3184,7 @@ async function getDrawerContextForEntry(entry) {
             title: album.title,
             subtitle: album.artist,
             albumId: album.id,
+            albumYear: album.year || entry.year || "",
             albumStarred: Boolean(album.starred),
             items: sortDrawerItemsByTrackNumber(album.tracks.map((track, index) => ({ track, index }))),
         };
@@ -3226,6 +3229,7 @@ async function getDrawerContextForEntry(entry) {
             title: album.title,
             subtitle: album.artist,
             albumId: album.id,
+            albumYear: album.year || entry.year || "",
             albumStarred: Boolean(album.starred),
             items: sortDrawerItemsByTrackNumber(album.tracks.map((track, index) => ({ track, index }))),
         };
@@ -3242,6 +3246,7 @@ async function getDrawerContextForEntry(entry) {
 function drawerContextSignature(entry) {
     return JSON.stringify([
         entry?.key,
+        entry?.year,
         entry?.groupAlbumIds || entry?.drawerAlbumId || entry?.albumId || entry?.id,
         entry?.groupTracks?.map((track) => track.key || track.id),
     ]);
@@ -3269,6 +3274,7 @@ async function ensureDrawerContext() {
     state.drawerContext = {
         key: entryKey,
         title: entry.title,
+        albumYear: entry.kind === "album" ? entry.year : "",
         subtitle: entry.subtitle,
         items: [],
         loading: true,
@@ -6289,7 +6295,7 @@ function renderSongsDrawer() {
     const context = state.drawerContext;
     const items = context.items || [];
     elements.songsDrawerEyebrow.textContent = context.loading ? "Loading..." : "Tracks";
-    elements.songsDrawerTitle.textContent = context.title || "Songs";
+    elements.songsDrawerTitle.textContent = albumTitleWithYear(context.title, context.albumYear);
     elements.songsDrawerSubtitle.textContent = context.subtitle || "\u00A0";
     elements.songsDrawerCount.textContent = context.loading ? "..." : formatCount(items.length, "song");
     const hasAlbumContext = Boolean(context.albumId);
@@ -6351,7 +6357,7 @@ function renderSongsDrawer() {
                 normalizeIdentityText(track?.album) === normalizeIdentityText(context.title);
             const subtitle = escapeHtml([
                 track?.artist,
-                rowAlbumMatchesHeader ? "" : track?.album,
+                rowAlbumMatchesHeader || !track?.album ? "" : albumTitleWithYear(track.album, track.year),
             ].filter(Boolean).join("  ·  "));
             const isCurrent = track?.id && state.currentTrack?.id === track.id;
             const isSelected = state.drawerSelectionIndex === rowIndex;
@@ -6493,7 +6499,9 @@ function buildSongInfoRows(track, index) {
         ["Nr", index + 1],
         ["Title", track?.title || "Unknown Title"],
         ["Artist", track?.artist || "Unknown Artist"],
-        ["Album Artist", track?.albumArtist || "Unknown"],
+        ["Album Artists", track?.albumArtist || "Unknown"],
+        ["Singer", track?.singer
+            ? `${track.singer}${track.singerSource === "artist" ? " (Artist)" : ""}` : "Unknown"],
         ["Composer", track?.composer
             ? `${track.composer}${track.composerSource === "albumArtist" ? " (Album Artist)" : ""}` : "Unknown"],
         ["Album", track?.album || "Unknown Album"],
@@ -6523,11 +6531,16 @@ function buildAlbumInfoRows(album) {
     const composers = metadataText([...new Set(taggedComposers)],
         album?.composerSource !== "albumArtist" ? album?.composer : "");
     const albumArtist = metadataText(album?.albumArtist, tracks.map((track) => track.albumArtist));
+    const artists = metadataText([...new Set(tracks.map((track) => metadataText(track.artist)).filter(Boolean))], album?.artist);
+    const singerDisplay = (track) => track?.singer
+        ? `${track.singer}${track.singerSource === "artist" ? " (Artist)" : ""}` : "";
+    const singers = metadataText([...new Set(tracks.map(singerDisplay).filter(Boolean))], singerDisplay(album));
     const composerDisplay = composers || (albumArtist ? `${albumArtist} (Album Artist)` : "Unknown");
     const rows = [
         ["Title", album?.title || "Untitled Album"],
-        ["Artist", album?.artist || "Unknown Artist"],
-        ["Album Artist", albumArtist || "Unknown"],
+        ["Album Artists", albumArtist || "Unknown"],
+        ["Artist", artists || "Unknown Artist"],
+        ["Singer", singers || "Unknown"],
         ["Composer", composerDisplay],
         ["Songs", album?.tracks?.length || album?.songCount || "Unknown"],
         ["Duration", album?.duration ? formatClock(album.duration, album.duration >= 3600) : "Unknown"],

@@ -53,11 +53,13 @@ Sorting regressions cover both year directions with fresh and cached results, un
 
 ## Album artists, composers and drawer loading
 
-Song and album **More Info** shows **Album Artist** separately from the performing artist. NaviGlass reads Navidrome's display fields, structured album-artist arrays and composer contributors as well as legacy tags. Explicit composer tags take precedence. When Composer is missing, a known Album Artist supplies the value and More Info labels the fallback **(Album Artist)**. A singer is not substituted for a missing album artist, and server tags are never changed.
+Song and album **More Info** shows **Album Artists**, **Artist**, **Singer** and **Composer** separately. NaviGlass reads Navidrome's display fields, structured album-artist arrays and composer/vocal contributors as well as legacy tags. Singer uses explicit singer/vocalist credits when available, otherwise the track Artist with an **(Artist)** source label. The album-level Artist and Singer rows collect credits from its songs. Explicit composer tags take precedence. When Composer is missing, a known Album Artist supplies the value and More Info labels the fallback **(Album Artist)**. Missing singer credits are never inferred from the album artist, and server tags are never changed.
+
+Album drawer headings include their release year, for example **Album (1991)**. Grouped albums use their album year or a consistent year from their songs. Missing or conflicting years are omitted, and playlist and individual-song headings retain their names. Album names shown within drawer rows also include the year where available.
 
 The song drawer shares pending requests for the same selection and reuses loaded rows when reopened. Failed requests leave the loading state with retry guidance. Background artwork and album-detail prefetching each use at most two concurrent requests, while the selected cover and foreground metadata receive priority. Album Artist and Composer library scans run when those menus are selected instead of on every connection. Older normalized browse caches are rebuilt once to read the new metadata fields; saved login settings and artwork caches are retained.
 
-Validation: all 100 Node tests pass. The synthetic browser check confirmed distinct Artist, Album Artist and Composer values, the labelled composer fallback, immediate cached drawer rows, a two-request artwork maximum, no full-song scan at startup and one selected-album metadata request across drawer reopening.
+Validation: all 106 Node tests pass. Synthetic browser checks confirmed separate Artist, Album Artists, Singer and Composer rows, **Album (1991)** drawer headings, the labelled credit fallbacks, immediate cached drawer rows, a two-request artwork maximum, no full-song scan at startup and one selected-album metadata request across drawer reopening.
 
 ## Audio Playback And Keyboard Controls
 
