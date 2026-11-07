@@ -3346,7 +3346,7 @@ function appendBrowseEntries(nextEntries) {
         const activeKey = state.activeEntryKey || browseEntries[state.browseIndex]?.key || "";
         const existingTextures = collectTextureLookup(browseEntries, textures);
         const previousLength = browseEntries.length;
-        browseEntries = groupAlbumEntriesByTitle(browseEntries.concat(nextEntries));
+        browseEntries = sortBrowseEntriesForCurrentMode(groupAlbumEntriesByTitle(browseEntries.concat(nextEntries)));
         textures = buildTexturesForEntries(browseEntries, existingTextures);
         const nextIndex = activeKey ? browseEntries.findIndex((entry) => entry.key === activeKey) : -1;
         if (nextIndex >= 0) {
@@ -3482,7 +3482,7 @@ async function continueProgressiveAlbumLoad(loadState) {
     }
 }
 
-async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}) {
+async function reloadBrowseEntries({ preferredKey = null, animate = false, resetPosition = false } = {}) {
     if (!state.connected) {
         return;
     }
@@ -3505,12 +3505,12 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
     }
     if (cachedBrowse) {
         activeBrowseEntryCacheKey = nextBrowseCacheKey;
-        browseEntries = cachedBrowse.entries.slice();
+        browseEntries = sortBrowseEntriesForCurrentMode(cachedBrowse.entries);
         browseCountKey = nextBrowseCacheKey;
         textures = buildTexturesForEntries(browseEntries);
 
         const currentTrackKey = keyForTrackInCurrentMode(state.currentTrack);
-        const fallbackKey =
+        const fallbackKey = resetPosition ? null :
             preferredKey ||
             currentTrackKey ||
             state.activeEntryKey ||
@@ -3520,7 +3520,7 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
             null;
 
         let nextIndex = fallbackKey ? browseEntries.findIndex((entry) => entry.key === fallbackKey) : -1;
-        if (nextIndex < 0 && browseEntries.length > 0) {
+        if (!resetPosition && nextIndex < 0 && browseEntries.length > 0) {
             nextIndex = clamp(cachedBrowse.browseIndex, 0, browseEntries.length - 1);
         }
         if (nextIndex < 0) {
@@ -3590,7 +3590,7 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
         textures = buildTexturesForEntries(browseEntries, previousTextures);
 
         const currentTrackKey = keyForTrackInCurrentMode(state.currentTrack);
-        const fallbackKey =
+        const fallbackKey = resetPosition ? null :
             preferredKey ||
             currentTrackKey ||
             state.activeEntryKey ||
@@ -3598,7 +3598,7 @@ async function reloadBrowseEntries({ preferredKey = null, animate = false } = {}
             null;
 
         let nextIndex = fallbackKey ? browseEntries.findIndex((entry) => entry.key === fallbackKey) : -1;
-        if (nextIndex < 0 && browseEntries.length > 0) {
+        if (!resetPosition && nextIndex < 0 && browseEntries.length > 0) {
             nextIndex = clamp(state.browseIndex, 0, browseEntries.length - 1);
         }
         if (nextIndex < 0) {
@@ -9472,7 +9472,7 @@ function setupInput() {
             state.settings.artistBrowseSort = normalizeBrowseSort(sortOption.dataset.sortMode);
             saveSettings();
             if (isArtistBrowseMode()) {
-                await reloadBrowseEntries({ animate: false });
+                await reloadBrowseEntries({ animate: false, resetPosition: true });
             }
             renderBrowseMenus();
             return;
@@ -9517,7 +9517,7 @@ function setupInput() {
             state.settings.albumBrowseSort = normalizeBrowseSort(sortOption.dataset.sortMode);
             saveSettings();
             if (state.browseMode === BROWSE_MODE.ALBUM) {
-                await reloadBrowseEntries({ animate: false });
+                await reloadBrowseEntries({ animate: false, resetPosition: true });
             }
             renderBrowseMenus();
         }
@@ -9539,7 +9539,7 @@ function setupInput() {
             state.settings.playlistBrowseSort = normalizeBrowseSort(sortOption.dataset.sortMode);
             saveSettings();
             if (state.browseMode === BROWSE_MODE.PLAYLIST) {
-                await reloadBrowseEntries({ animate: false });
+                await reloadBrowseEntries({ animate: false, resetPosition: true });
             }
             renderBrowseMenus();
             return;
@@ -9578,7 +9578,7 @@ function setupInput() {
             state.settings.songsBrowseSort = normalizeBrowseSort(sortOption.dataset.sortMode);
             saveSettings();
             if (state.browseMode === BROWSE_MODE.SONGS) {
-                await reloadBrowseEntries({ animate: false });
+                await reloadBrowseEntries({ animate: false, resetPosition: true });
             }
             renderBrowseMenus();
             return;

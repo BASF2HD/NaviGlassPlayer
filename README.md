@@ -45,6 +45,12 @@ https://basf2hd.github.io/NaviGlassPlayer/
 - CSV export for favourite songs, favourite albums, and selected playlists
 - Local Node proxy so Navidrome credentials and media stay on the configured server path
 
+## Library sorting
+
+Choosing a sort order starts at the first result: **Year: High to Low** opens at the newest album and **Year: Low to High** at the oldest. Cached views and additional album pages retain the selected order. Albums without a year appear last, with titles breaking ties between matching years. Ordinary library reloads retain the selected album, and changing the browse order does not interrupt playback.
+
+Validation: 86 Node tests pass, including both year directions with fresh and cached results, unknown-year handling, selection preservation, and ordering across an additional 220-album page.
+
 ## Audio Playback And Keyboard Controls
 
 With Navidrome 0.62.0 or newer, playback uses the same codec-specific browser profile and OpenSubsonic transcode-decision API as [Navidrome's web player](https://github.com/navidrome/navidrome/blob/v0.62.0/ui/src/transcode/browserProfile.js). Supported codecs play directly, including WAV and FLAC when the browser supports them. Otherwise, Navidrome chooses a supported conversion: lossless FLAC first, then Opus or MP3. Safari uses MP3 for converted streams, matching Navidrome's compatibility policy. MP3/Opus conversions are lossy; direct playback and lossless FLAC conversion do not intentionally reduce audio quality. A decoder failure retries once with an MP3 compatibility profile.
