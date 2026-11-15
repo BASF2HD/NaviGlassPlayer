@@ -25,9 +25,40 @@ function fixture() {
         section("function normalizeComposerOptions(", "async function ensureComposerOptions("),
         section("async function ensureAlbumDetails(", "function albumDetailIdsForEntry("),
         section("async function getDrawerContextForEntry(", "function drawerContextSignature("),
+        section("function formatInfoPanelSubtitle(", "function getInfoActionSubject("),
     ].join("\n"), context);
     return context;
 }
+
+test("playing and browsed songs show track Artist and year under the title", () => {
+    const context = fixture();
+    const year = "2022";
+    const song = context.normalizeTrack({ id: "song", title: "Song", album: "Soundtrack", year,
+        artist: "Playback Singer", displaySinger: "Other Vocalist", albumArtist: "Music Director" });
+    const album = { kind: "album", title: "Soundtrack", artist: "Music Director", year };
+    context.playbackState = {};
+    context.state.currentTrack = song;
+    context.getCurrentBrowseEntry = () => album;
+    context.entryMatchesCurrentTrackInCurrentMode = () => true;
+    assert.equal(context.getInfoPanelLines().title, "Song");
+    assert.equal(context.getInfoPanelLines().subtitle.text, "Playback Singer | 2022");
+    context.entryMatchesCurrentTrackInCurrentMode = () => false;
+    assert.equal(context.getInfoPanelLines().subtitle.text, "Music Director | 2022");
+    context.getCurrentBrowseEntry = () => song;
+    assert.equal(context.getInfoPanelLines().subtitle.text, "Playback Singer | 2022");
+});
+
+test("song subtitle uses singer credits and does not inherit the album artist", () => {
+    const context = fixture();
+    const track = { artist: "Unknown Artist", albumArtist: "Music Director", year: "1991" };
+    const makeSubtitle = (tags) => context.formatSongInfoPanelSubtitle(
+        context.normalizeTrack({ ...track, ...tags }, { artist: "Music Director" }), track.year
+    ).text;
+    assert.equal(makeSubtitle({ singer: "Vocalist" }), "Vocalist | 1991");
+    assert.equal(makeSubtitle({}), "Unknown Artist | 1991");
+    assert.equal(makeSubtitle({ artists: [{ name: "Music Director" }] }), "Music Director | 1991",
+        "the same person can be credited as both track artist and album artist");
+});
 
 test("Navidrome display fields and structured album artists remain separate from the singer", () => {
     const context = fixture();

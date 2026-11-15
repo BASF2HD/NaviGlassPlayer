@@ -30,7 +30,7 @@ import { audioStreamParams, isTimeInRanges, needsSeekRecovery, streamElapsed, st
 import { browserPlaybackProfile, createPlaybackDecisions, decisionStreamParams } from "./navidrome-playback.js?v=2";
 import { normalizeRepeatMode, nextRepeatMode, buildPlaybackOrder, playbackStep, samePlaybackQueue } from "./playback-order.js?v=1";
 import { createAudioOutputSettings } from "./audio-output.js?v=1";
-import { metadataText, readMusicMetadata, commonAlbumYear, albumTitleWithYear } from "./music-metadata.js?v=2";
+import { metadataText, readMusicMetadata, commonAlbumYear, albumTitleWithYear } from "./music-metadata.js?v=3";
 import { createRequestQueue } from "./request-queue.js?v=1";
 
 const STORAGE_KEY = "naviglassplayer-settings";
@@ -54,7 +54,7 @@ const CACHE_DB_NAME = "naviglassplayer-cache";
 const CACHE_DB_VERSION = 1;
 const BROWSE_CACHE_STORE = "browseViews";
 const ARTWORK_CACHE_STORE = "artwork";
-const BROWSE_CACHE_SCHEMA_VERSION = 7;
+const BROWSE_CACHE_SCHEMA_VERSION = 8;
 const PERSISTENT_BROWSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_PERSISTENT_ARTWORK_ITEMS = 3500;
 const STREAM_CACHE_SEEK_WAIT_MS = 45000;
@@ -1356,8 +1356,7 @@ function normalizeTrack(track, options = {}) {
     const id = String(track.id || options.fallbackId || "");
     const albumId = String(track.albumId || track.parent || options.albumId || "");
     const metadata = readMusicMetadata(track, options);
-    const artist = metadataText(track.displayArtist, track.artist, track.artistName, track.artists,
-        options.artist, metadata.albumArtist) || "Unknown Artist";
+    const artist = metadata.trackArtist || metadataText(options.artist, metadata.albumArtist) || "Unknown Artist";
     const album = pickText(
         track.album,
         track.albumName,
@@ -3761,23 +3760,26 @@ function formatInfoPanelSubtitle(...parts) {
 
 function getInfoPanelLines() {
     const activeEntry = getCurrentBrowseEntry();
-    const songTitle = pickText(state.currentTrack?.title, playbackState.title);
-    const albumName = pickText(state.currentTrack?.album, playbackState.album);
-    const trackYear = pickText(state.currentTrack?.year, activeEntry?.year);
+    const currentTrack = state.currentTrack;
+    const songTitle = pickText(currentTrack?.title, playbackState.title);
+    const albumName = pickText(currentTrack?.album, playbackState.album);
+    const trackYear = pickText(currentTrack?.year, activeEntry?.year);
     const isCenteredOnCurrentTrack = entryMatchesCurrentTrackInCurrentMode(activeEntry);
     const shouldShowNowPlaying = Boolean(songTitle || albumName) && (!activeEntry || isCenteredOnCurrentTrack);
 
     if (shouldShowNowPlaying) {
         return {
             title: songTitle || activeEntry?.title || "Nothing loaded",
-            subtitle: formatInfoPanelSubtitle(albumName, trackYear),
+            subtitle: currentTrack?.kind === "radio"
+                ? formatInfoPanelSubtitle(albumName, trackYear)
+                : formatSongInfoPanelSubtitle(currentTrack, trackYear),
         };
     }
 
     if (activeEntry?.kind === "song") {
         return {
             title: activeEntry.title || "Nothing loaded",
-            subtitle: formatInfoPanelSubtitle(activeEntry.album, activeEntry.year),
+            subtitle: formatSongInfoPanelSubtitle(activeEntry, activeEntry.year),
         };
     }
 
@@ -3793,6 +3795,10 @@ function getInfoPanelLines() {
     return {
         ...getEmptyBrowseLines(),
     };
+}
+
+function formatSongInfoPanelSubtitle(track, year) {
+    return formatInfoPanelSubtitle(pickText(track?.trackArtist, track?.singer, "Unknown Artist"), year);
 }
 
 function getInfoActionSubject() {

@@ -42,6 +42,7 @@ export function readMusicMetadata(record = {}, options = {}) {
         options.composer
     );
     return {
+        trackArtist: taggedArtist,
         albumArtist,
         composer: taggedComposer || albumArtist,
         composerSource: taggedComposer ? "tag" : albumArtist ? "albumArtist" : "",
