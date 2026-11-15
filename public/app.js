@@ -141,6 +141,7 @@ const elements = {
     infoPanel: document.getElementById("info-panel"),
     trackTitle: document.getElementById("track-title"),
     trackArtist: document.getElementById("track-artist"),
+    trackAlbum: document.getElementById("track-album"),
     btnInfoMenu: document.getElementById("btn-info-menu"),
     infoContextMenu: document.getElementById("info-context-menu"),
     btnDrawer: document.getElementById("btn-drawer"),
@@ -3770,16 +3771,16 @@ function getInfoPanelLines() {
     if (shouldShowNowPlaying) {
         return {
             title: songTitle || activeEntry?.title || "Nothing loaded",
-            subtitle: currentTrack?.kind === "radio"
-                ? formatInfoPanelSubtitle(albumName, trackYear)
-                : formatSongInfoPanelSubtitle(currentTrack, trackYear),
+            ...(currentTrack?.kind === "radio"
+                ? { subtitle: formatInfoPanelSubtitle(albumName, trackYear) }
+                : getSongInfoPanelSubtitles(currentTrack, albumName, trackYear)),
         };
     }
 
     if (activeEntry?.kind === "song") {
         return {
             title: activeEntry.title || "Nothing loaded",
-            subtitle: formatSongInfoPanelSubtitle(activeEntry, activeEntry.year),
+            ...getSongInfoPanelSubtitles(activeEntry, activeEntry.album, activeEntry.year),
         };
     }
 
@@ -3797,8 +3798,11 @@ function getInfoPanelLines() {
     };
 }
 
-function formatSongInfoPanelSubtitle(track, year) {
-    return formatInfoPanelSubtitle(pickText(track?.trackArtist, track?.singer, "Unknown Artist"), year);
+function getSongInfoPanelSubtitles(track, album, year) {
+    return {
+        subtitle: pickText(track?.trackArtist, track?.singer, "Unknown Artist"),
+        albumSubtitle: pickText(album, year) ? formatInfoPanelSubtitle(album, year) : null,
+    };
 }
 
 function getInfoActionSubject() {
@@ -4977,23 +4981,26 @@ function updatePlaybackStripUI() {
 
 function updateBrowseSummary() {
     const infoLines = getInfoPanelLines();
+    const showAlbum = Boolean(infoLines.albumSubtitle);
+    const albumVisibilityChanged = elements.trackAlbum.hidden === showAlbum;
     elements.trackTitle.textContent = infoLines.title;
-    renderInfoPanelSubtitle(infoLines.subtitle);
+    renderInfoPanelSubtitle(elements.trackArtist, infoLines.subtitle);
+    elements.trackAlbum.hidden = !showAlbum;
+    if (showAlbum) renderInfoPanelSubtitle(elements.trackAlbum, infoLines.albumSubtitle);
     renderInfoActionMenu();
     updateBrowseStripUI();
+    if (albumVisibilityChanged) positionInfoPanel();
 }
 
-function renderInfoPanelSubtitle(subtitle) {
-    const target = elements.trackArtist;
+function renderInfoPanelSubtitle(target, subtitle) {
     target.textContent = "";
     if (!subtitle || typeof subtitle !== "object") {
-        target.textContent = pickText(subtitle, "\u00A0");
-        return;
+        subtitle = { primary: subtitle };
     }
     const primary = pickText(subtitle.primary);
     const year = pickText(subtitle.year);
     if (!primary && !year) {
-        target.textContent = pickText(subtitle.text, "\u00A0");
+        target.textContent = pickText(subtitle.text) || "\u00A0";
         return;
     }
     if (primary) {
@@ -5670,6 +5677,7 @@ function fitInfoPanelTypography(coverWidthPx, availableHeightPx) {
     const safeWidth = Math.max(120, coverWidthPx || 0);
     const safeHeight = Math.max(10, Math.floor(availableHeightPx || 0));
     const fontScale = albumInfoFontScale;
+    const showAlbum = !elements.trackAlbum.hidden;
     const compactMode = safeHeight < 26;
     const tinyMode = safeHeight < 18;
     let lineHeight = tinyMode ? 0.98 : compactMode ? 1.04 : 1.15;
@@ -5686,7 +5694,9 @@ function fitInfoPanelTypography(coverWidthPx, availableHeightPx) {
     const padTop = tinyMode ? 0 : clamp(Math.round(safeHeight * 0.01), 0, 2);
     let gap = tinyMode ? 0 : clamp(Math.round(titleSize * 0.08), 1, 4);
 
-    const contentHeight = () => Math.ceil(titleSize * lineHeight) + Math.ceil(artistSize * lineHeight) + gap + padTop;
+    const albumSize = () => Math.max(8, Math.round(artistSize * 0.84));
+    const contentHeight = () => Math.ceil(titleSize * lineHeight) + Math.ceil(artistSize * lineHeight) + gap + padTop
+        + (showAlbum ? Math.ceil(albumSize() * lineHeight) + gap : 0);
 
     for (let step = 0; step < 40 && contentHeight() > safeHeight; step += 1) {
         let changed = false;
@@ -5714,10 +5724,12 @@ function fitInfoPanelTypography(coverWidthPx, availableHeightPx) {
     const panelStyle = elements.infoPanel.style;
     panelStyle.setProperty("--info-title-size", `${titleSize}px`);
     panelStyle.setProperty("--info-artist-size", `${artistSize}px`);
+    panelStyle.setProperty("--info-album-size", `${albumSize()}px`);
     panelStyle.setProperty("--info-gap", `${gap}px`);
     panelStyle.padding = `${padTop}px ${padX}px 0`;
     elements.trackTitle.style.lineHeight = String(lineHeight);
     elements.trackArtist.style.lineHeight = String(lineHeight);
+    elements.trackAlbum.style.lineHeight = String(lineHeight);
 
     return {
         titleSize,
@@ -6078,7 +6090,8 @@ function positionInfoPanel() {
     // album-info panel by lifting the whole cover block a little more
     // instead of shrinking the text into illegibility.
     const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 480;
-    const minReadableInfoHeight = clamp(Math.round(viewportHeight * 0.065), 21, 30);
+    const showAlbum = !elements.trackAlbum.hidden;
+    const minReadableInfoHeight = clamp(Math.round(viewportHeight * 0.065), 21, 30) + (showAlbum ? 11 : 0);
     for (let pass = 0; pass < 2; pass += 1) {
         const infoPanelGap = clamp(Math.round(coverHeightPx * 0.006), 1, 3);
         const infoBottomMargin = clamp(Math.round(coverHeightPx * 0.012), 2, 6);
@@ -6121,7 +6134,7 @@ function positionInfoPanel() {
         Math.floor((fullscreenActive ? containerHeight : controlsTopLocal) - minInfoTop - infoBottomMargin)
     );
 
-    if (!fullscreenActive && availableInfoHeight < 10) {
+    if (!fullscreenActive && !showAlbum && availableInfoHeight < 10) {
         elements.infoPanel.style.display = "none";
     } else {
         elements.infoPanel.style.display = "";
@@ -6160,6 +6173,9 @@ function positionInfoPanel() {
                 desiredBottomGap
             );
             infoTop = Math.max(minInfoTop, preferredInfoTop);
+        }
+        if (showAlbum && !fullscreenActive) {
+            infoTop = Math.min(infoTop, Math.floor(controlsTopLocal - infoBottomMargin - infoLayout.height));
         }
         elements.infoPanel.style.top = `${Math.max(0, infoTop)}px`;
     }

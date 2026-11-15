@@ -958,7 +958,8 @@ body.is-player-fullscreen #controls,
     text-shadow: 0 2px 4px rgba(0,0,0,0.5);
 }
 
-#track-artist {
+#track-artist,
+#track-album {
     grid-column: 1;
     grid-row: 2;
     justify-self: center;
@@ -976,6 +977,15 @@ body.is-player-fullscreen #controls,
     line-height: 1.15;
     max-width: 100%;
     text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+
+#track-album {
+    grid-row: 3;
+    font-size: var(--info-album-size, 15px);
+}
+
+#track-album[hidden] {
+    display: none;
 }
 
 .info-subtitle-primary {
